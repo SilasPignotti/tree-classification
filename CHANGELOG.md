@@ -8,6 +8,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Added
+
 - Initial project structure with data directories (`data/raw/`, `data/processed/`, `data/boundaries/`), scripts, notebooks, and docs
 - UV virtual environment setup for dependency management
 - Restructured scripts into city-specific subfolders:
@@ -22,9 +23,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   - Generates visualization comparing original and buffered boundaries
 - Hamburg elevation script (`scripts/elevation/hamburg/download_elevation.py`):
   - Downloads DOM and DGM from Hamburg Open Data portal
-  - Handles XYZ ASCII format conversion to GeoTIFF using GDAL
+  - **Data format**: XYZ ASCII in ZIP (multiple tiles covering city)
+  - **Fixed**: Initial version only processed first tile (1km²) - now processes all ~850+ tiles
+  - Converts ALL XYZ tiles to GeoTIFF using `gdal_translate`
+  - **Handles mixed raster orientations** - uses direct `gdalwarp` merge (no VRT) for tiles with inconsistent Y-axis direction
+  - Mosaics all tiles with `rasterio.merge` (DOM) or `gdalwarp` (DGM with orientation issues)
   - Clips to city boundary with 500m buffer
   - Saves as `data/raw/hamburg/{dom,dgm}_1m.tif`
+  - **Validation results**: DOM 2.3GB (40,363×39,000 pixels), DGM 1.1GB (40,418×39,132 pixels)
+  - Full city coverage: ~736 km²
 - Berlin elevation script (`scripts/elevation/berlin/download_elevation.py`):
   - Parses nested Atom feed structure for DOM and DGM tiles
   - **Data format**: XYZ ASCII in ZIP (not GeoTIFF as originally documented)
@@ -46,19 +53,54 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   - Saves as `data/raw/rostock/{dom,dgm}_1m.tif`
   - **Validation results**: DOM 657MB (48.2% valid pixels), DGM 584MB (47.9% valid pixels)
   - ~52% NoData expected due to irregular city boundary clipping and Baltic Sea water bodies
-- Dependencies: `geopandas`, `requests`, `matplotlib`, `rasterio`, `feedparser`, `tqdm`, `numpy`
+- Sentinel-2 download script (`scripts/sentinel2/download_sentinel2.py`):
+  - Downloads Sentinel-2 L2A monthly median composites using openEO (Copernicus Data Space)
+  - Cloud-native processing: cloud masking (SCL band), temporal aggregation, resampling all server-side
+  - **Output**: 10 spectral bands (B02-B12, excluding B01/B09/B10) @ 10m resolution
+  - Cloud masking excludes: shadows (3), medium clouds (8), high clouds (9), thin cirrus (10)
+  - 20m bands (B05-B07, B8A, B11, B12) resampled to 10m via bilinear interpolation
+  - **CLI interface**: `--cities`, `--year`, `--months` (range notation e.g. "4-10"), `--output`, `--no-resume`
+  - Checkpointing: skips already downloaded and validated files (use `--no-resume` to override)
+  - Validation checks: band count (10), CRS, resolution (~10m), valid pixels >30%, reflectance 0-10000
+  - **Expected output**: `data/sentinel2/{city}/S2_2024_{MM}_median.tif` (36 files total)
+- CHM (Canopy Height Model) creation script (`scripts/chm/create_chm.py`):
+  - Computes CHM = DOM - DGM for Hamburg, Berlin, and Rostock
+  - Handles shape mismatches by cropping to common extent (e.g., Berlin: 37360×46092 → 37359×46092)
+  - Applies quality filters: negative values → 0, outliers >60m → 60m (capped)
+  - Computes statistics for full extent and city core (masked by `city_boundaries.gpkg`)
+  - Generates comprehensive visualizations: histograms, box plots, CDFs, spatial maps, QA plots
+  - Saves cleaned CHMs to `data/processed/CHM_1m_{City}.tif` with DEFLATE compression (predictor=3, 512×512 tiles)
+  - Exports statistics to `data/processed/chm_statistics.csv`
+  - Smart skip logic: preserves existing city statistics when re-running
+  - **Output files**:
+    - Hamburg: 1.7GB (40,363×39,000 pixels, 47.5% valid, mean 4.08m)
+    - Berlin: 2.3GB (46,092×37,359 pixels, 54.6% valid, mean 6.39m)
+    - Rostock: 465MB (19,822×22,953 pixels, 46.6% valid, mean 5.03m)
+  - **Quality validation**: All cities passed plausibility checks (0 negative pixels, 0 outliers >60m)
+- Jupyter notebook for CHM analysis (`notebooks/chm/chm_creation_qa.ipynb`):
+  - Interactive version of CHM creation with detailed exploration
+  - Same processing pipeline as Python script
+- Documentation:
+  - `docs/documentation/01_Datenakquise_Methodik.md` - Elevation data acquisition methodology
+  - `docs/documentation/02_CHM_Berechnung_Methodik.md` - CHM calculation and quality assessment methodology
+- Dependencies: `geopandas`, `requests`, `matplotlib`, `rasterio`, `feedparser`, `tqdm`, `numpy`, `pandas`, `openeo`, `jupyter`, `jupyterlab`
 
 ### Changed
+
 - N/A
 
 ### Deprecated
+
 - N/A
 
 ### Removed
+
 - N/A
 
 ### Fixed
+
 - N/A
 
 ### Security
+
 - N/A

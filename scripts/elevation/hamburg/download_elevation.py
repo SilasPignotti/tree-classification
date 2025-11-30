@@ -15,6 +15,7 @@ import geopandas as gpd
 import rasterio
 import requests
 from rasterio.mask import mask
+from rasterio.merge import merge
 from tqdm import tqdm
 
 
@@ -163,29 +164,145 @@ def xyz_to_geotiff(
         raise
 
 
-def clip_raster_to_boundary(
-    raster_path: Path, boundary_gdf: gpd.GeoDataFrame, output_path: Path
+def mosaic_with_gdalwarp(
+    geotiff_paths: list[Path], boundary_gdf: gpd.GeoDataFrame, output_path: Path
 ) -> None:
     """
-    Clippt Raster auf Stadtgrenze.
+    Mosaiciert Tiles mit gdalwarp (für upside-down Raster).
 
     Args:
-        raster_path: Pfad zum Input-Raster
+        geotiff_paths: Liste von GeoTIFF-Pfaden
         boundary_gdf: GeoDataFrame mit Stadtgrenze
         output_path: Ausgabe-Pfad
     """
-    logger.info(f"Clipping {raster_path.name} to city boundary...")
+    logger.info(f"Using gdalwarp to mosaic {len(geotiff_paths)} tiles...")
 
-    with rasterio.open(raster_path) as src:
-        # Boundary in Raster-CRS transformieren
+    # Create VRT from all tiles
+    temp_vrt = output_path.parent / f"{output_path.stem}_temp.vrt"
+    temp_mosaic = output_path.parent / f"{output_path.stem}_temp.tif"
+
+    # Build VRT
+    vrt_cmd = ["gdalbuildvrt", str(temp_vrt)] + [str(p) for p in geotiff_paths]
+
+    try:
+        subprocess.run(vrt_cmd, check=True, capture_output=True, timeout=300)
+        logger.info(f"Created VRT with {len(geotiff_paths)} tiles")
+    except subprocess.CalledProcessError as e:
+        logger.error(f"VRT creation failed: {e.stderr.decode()}")
+        raise
+
+    # Get boundary bounds in raster CRS
+    with rasterio.open(geotiff_paths[0]) as src:
+        raster_crs = src.crs
+    boundary_reproj = boundary_gdf.to_crs(raster_crs)
+    minx, miny, maxx, maxy = boundary_reproj.total_bounds
+
+    # Warp and clip VRT to boundary
+    warp_cmd = [
+        "gdalwarp",
+        "-te", str(minx), str(miny), str(maxx), str(maxy),
+        "-te_srs", str(raster_crs),
+        "-co", "COMPRESS=LZW",
+        "-co", "TILED=YES",
+        "-co", "BIGTIFF=YES",
+        str(temp_vrt),
+        str(output_path),
+    ]
+
+    try:
+        subprocess.run(warp_cmd, check=True, capture_output=True, timeout=1800)
+        logger.info(f"Warped and clipped to boundary")
+    except subprocess.CalledProcessError as e:
+        logger.error(f"Gdalwarp failed: {e.stderr.decode()}")
+        raise
+
+    # Cleanup temp files
+    temp_vrt.unlink()
+
+    logger.info(f"Mosaic saved to: {output_path}")
+
+
+def mosaic_and_clip(
+    geotiff_paths: list[Path], boundary_gdf: gpd.GeoDataFrame, output_path: Path
+) -> None:
+    """
+    Mosaiciert mehrere GeoTIFF-Tiles und clippt auf Stadtgrenze.
+
+    Args:
+        geotiff_paths: Liste von GeoTIFF-Pfaden
+        boundary_gdf: GeoDataFrame mit Stadtgrenze
+        output_path: Ausgabe-Pfad
+    """
+    if not geotiff_paths:
+        raise ValueError("No GeoTIFF tiles to mosaic")
+
+    logger.info(f"Mosaicking {len(geotiff_paths)} tiles...")
+
+    # Öffne alle Tiles und prüfe auf "upside down" Raster
+    src_files = []
+    needs_flip = False
+    for path in geotiff_paths:
+        try:
+            src = rasterio.open(path)
+            # Check if raster is upside down (negative pixel height)
+            if src.transform.e < 0:  # Negative Y pixel size
+                needs_flip = True
+            src_files.append(src)
+        except Exception as e:
+            logger.warning(f"Could not open {path}: {e}")
+
+    if not src_files:
+        raise ValueError("No valid GeoTIFF tiles to mosaic")
+
+    logger.info(f"Using {len(src_files)} valid tiles for mosaic")
+
+    if needs_flip:
+        logger.warning(
+            "Detected upside-down rasters (negative pixel height). "
+            "Using gdalwarp workaround..."
+        )
+        # Close files for gdalwarp approach
+        for src in src_files:
+            src.close()
+        src_files = []
+
+        # Use gdalwarp to merge upside-down rasters
+        return mosaic_with_gdalwarp(geotiff_paths, boundary_gdf, output_path)
+
+    try:
+        # Mosaic tiles with rasterio
+        mosaic, out_trans = merge(src_files, method="first")
+
+        # Temporäres Mosaic speichern
+        temp_mosaic = output_path.parent / f"{output_path.stem}_temp.tif"
+        out_meta = src_files[0].meta.copy()
+        out_meta.update({
+            "height": mosaic.shape[1],
+            "width": mosaic.shape[2],
+            "transform": out_trans,
+            "compress": "lzw",
+        })
+
+        with rasterio.open(temp_mosaic, "w", **out_meta) as dest:
+            dest.write(mosaic)
+
+        logger.info(f"Mosaic created: {mosaic.shape[1]}x{mosaic.shape[2]} pixels")
+
+    finally:
+        # Schließe alle Source-Files
+        for src in src_files:
+            src.close()
+
+    # Clip to boundary
+    logger.info("Clipping mosaic to city boundary...")
+
+    with rasterio.open(temp_mosaic) as src:
         boundary_reproj = boundary_gdf.to_crs(src.crs)
 
-        # Clip
         out_image, out_transform = mask(
             src, boundary_reproj.geometry, crop=True, all_touched=True
         )
 
-        # Metadaten aktualisieren
         out_meta = src.meta.copy()
         out_meta.update({
             "height": out_image.shape[1],
@@ -194,11 +311,13 @@ def clip_raster_to_boundary(
             "compress": "lzw",
         })
 
-        # Speichern
         with rasterio.open(output_path, "w", **out_meta) as dest:
             dest.write(out_image)
 
-    logger.info(f"Clipped raster saved to: {output_path}")
+    # Cleanup temp mosaic
+    temp_mosaic.unlink()
+
+    logger.info(f"Clipped mosaic saved to: {output_path}")
 
 
 def validate_geotiff(file_path: Path) -> bool:
@@ -248,17 +367,35 @@ def process_elevation_data(
     download_file(url, zip_path, f"{data_type} ZIP")
 
     # Extract XYZ
-    xyz_files = extract_xyz_from_zip(zip_path, temp_dir / data_type.lower())
+    extract_dir = temp_dir / data_type.lower()
+    xyz_files = extract_xyz_from_zip(zip_path, extract_dir)
 
-    # Convert first XYZ to GeoTIFF (Hamburg has single XYZ per product)
     if not xyz_files:
         raise FileNotFoundError(f"No XYZ files found in {zip_path}")
 
-    geotiff_temp = temp_dir / f"{data_type.lower()}_temp.tif"
-    xyz_to_geotiff(xyz_files[0], geotiff_temp)
+    logger.info(f"Found {len(xyz_files)} XYZ files to process")
 
-    # Clip to boundary
-    clip_raster_to_boundary(geotiff_temp, boundary_gdf, output_path)
+    # Convert ALL XYZ files to GeoTIFF
+    geotiff_dir = temp_dir / f"{data_type.lower()}_tif"
+    geotiff_dir.mkdir(exist_ok=True)
+    geotiff_paths = []
+
+    for i, xyz_file in enumerate(xyz_files, 1):
+        logger.info(f"Converting tile {i}/{len(xyz_files)}: {xyz_file.name}")
+        geotiff_path = geotiff_dir / f"{xyz_file.stem}.tif"
+        try:
+            xyz_to_geotiff(xyz_file, geotiff_path)
+            geotiff_paths.append(geotiff_path)
+        except Exception as e:
+            logger.warning(f"Failed to convert {xyz_file.name}: {e}")
+
+    if not geotiff_paths:
+        raise ValueError("No GeoTIFF tiles were successfully created")
+
+    logger.info(f"Successfully converted {len(geotiff_paths)}/{len(xyz_files)} tiles")
+
+    # Mosaic all tiles and clip to boundary
+    mosaic_and_clip(geotiff_paths, boundary_gdf, output_path)
 
     # Validate
     if not validate_geotiff(output_path):
