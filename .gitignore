@@ -8,3 +8,11 @@ wheels/
 
 # Virtual environments
 .venv
+
+# Large data files
+data/raw/
+data/processed/*.tif
+data/sentinel2/
+
+# Task management
+tasks/
