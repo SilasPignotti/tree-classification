@@ -83,7 +83,41 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Documentation:
   - `docs/documentation/01_Datenakquise_Methodik.md` - Elevation data acquisition methodology
   - `docs/documentation/02_CHM_Berechnung_Methodik.md` - CHM calculation and quality assessment methodology
-- Dependencies: `geopandas`, `requests`, `matplotlib`, `rasterio`, `feedparser`, `tqdm`, `numpy`, `pandas`, `openeo`, `jupyter`, `jupyterlab`
+- Tree cadastre download script (`scripts/tree_cadastres/download_tree_cadastres.py`):
+  - Downloads tree cadastre data for Hamburg, Berlin, and Rostock
+  - **Hamburg**: OGC API Features (229,013 trees, 22 attributes)
+  - **Berlin**: WFS with two layers combined (anlagenbaeume + strassenbaeume = 945,907 trees, 22 attributes)
+  - **Rostock**: WFS (70,756 trees, 17 attributes)
+  - Extracts comprehensive schema metadata: dtypes, null counts, unique values, sample values
+  - Generates cross-city comparison CSV (`schema_summary.csv`)
+  - Saves individual schema JSONs per city
+  - **Output**: `data/tree_cadastres/raw/{city}_trees_raw.gpkg` + `data/tree_cadastres/metadata/`
+- Tree cadastre harmonization script (`scripts/tree_cadastres/harmonize_tree_cadastres.py`):
+  - Harmonizes Berlin, Hamburg, and Rostock tree cadastres into unified schema
+  - **CRS harmonization**: Berlin/Rostock EPSG:25833 → EPSG:25832 (Hamburg already 25832)
+  - **Geometry unification**: Hamburg MultiPoint → Point conversion
+  - **Schema normalization**: 10 standardized columns (`tree_id`, `city`, `genus_latin`, `species_latin`, `plant_year`, `height_m`, `crown_diameter_m`, `stem_circumference_cm`, `source_layer`, `geometry`)
+  - **Genus normalization**: Uppercase Latin genus names for consistent classification labels
+  - **Validation**: CRS check, geometry type check, uniqueness check, city presence check
+  - **Output**: `data/tree_cadastres/processed/trees_harmonized.gpkg` (210.5 MB, 1,245,676 trees)
+  - **Statistics**: Top genera: TILIA (20.9%), ACER (20.6%), QUERCUS (13.3%)
+- Documentation:
+  - `docs/documentation/03_Baumkataster_Methodik.md` - Tree cadastre acquisition and harmonization methodology
+- Tree cadastre filtering script (`scripts/tree_cadastres/filter_trees.py`):
+  - Applies temporal, spatial, and genus viability filters to harmonized tree data
+  - **Temporal filter**: Excludes trees planted after CHM reference year (2021), retains NaN plant_year
+  - **Spatial filter**: Clips to city boundaries (removes 500m buffer zone trees)
+  - **Edge distance calculation**: KD-Tree per genus for O(n log n) nearest-neighbor search
+  - **Genus viability check**: Identifies genera with ≥500 samples in ALL three cities
+  - **Spatial grid assignment**: 1km² cells for future stratified sampling (`grid_id` column)
+  - **Two output variants**:
+    - `trees_filtered_viable_no_edge.gpkg`: 1,140,172 trees, 20 viable genera
+    - `trees_filtered_viable_edge_15m.gpkg`: 365,037 trees (≥15m from other genera), 8 viable genera
+  - **Viable genera (no_edge)**: ACER, AESCULUS, ALNUS, BETULA, CARPINUS, CORYLUS, CRATAEGUS, FAGUS, FRAXINUS, MALUS, PINUS, PLATANUS, POPULUS, PRUNUS, QUERCUS, ROBINIA, SALIX, SORBUS, TILIA, ULMUS
+  - **Viable genera (edge_15m)**: ACER, BETULA, FRAXINUS, POPULUS, PRUNUS, QUERCUS, SORBUS, TILIA
+  - **Metadata exports**: `genus_viability_{variant}.csv`, `all_genera_counts_{variant}.csv`, `filtering_losses_{variant}.csv`, `filtering_report_{variant}.json`
+  - **Filtering losses**: 1.5% temporal, 0.5% spatial, 6.7%/22.4% genus viability (no_edge/edge_15m)
+- Dependencies: `geopandas`, `requests`, `matplotlib`, `rasterio`, `feedparser`, `tqdm`, `numpy`, `pandas`, `openeo`, `jupyter`, `jupyterlab`, `owslib`, `scipy`
 
 ### Changed
 
