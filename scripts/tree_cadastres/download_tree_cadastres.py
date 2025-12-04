@@ -8,6 +8,7 @@ Rostock: WFS
 """
 
 import json
+import sys
 from pathlib import Path
 
 import geopandas as gpd
@@ -16,81 +17,55 @@ import pandas as pd
 import requests
 from owslib.wfs import WebFeatureService
 
-
-# Konstanten
-BASE_DIR = Path("data/tree_cadastres")
-RAW_DIR = BASE_DIR / "raw"
-METADATA_DIR = BASE_DIR / "metadata"
-
-# Konfiguration pro Stadt
-CITY_CONFIG = {
-    "Hamburg": {
-        "type": "ogc_api_features",
-        "url": "https://api.hamburg.de/datasets/v1/strassenbaumkataster/collections/strassenbaumkataster_hh/items",
-        "crs": "EPSG:25832",
-    },
-    "Berlin": {
-        "type": "wfs",
-        "url": "https://gdi.berlin.de/services/wfs/baumbestand",
-        "layers": ["baumbestand:anlagenbaeume", "baumbestand:strassenbaeume"],
-    },
-    "Rostock": {
-        "type": "wfs",
-        "url": "https://geo.sv.rostock.de/geodienste/baeume/wfs",
-        "layers": None,  # Alle Layer verwenden
-    },
-}
+sys.path.insert(0, str(Path(__file__).parent.parent))
+from config import (
+    CITIES,
+    TARGET_CRS,
+    TREE_CADASTRE_CONFIG,
+    TREE_CADASTRES_METADATA_DIR,
+    TREE_CADASTRES_RAW_DIR,
+)
 
 
 def download_ogc_api_features(
-    city_name: str, base_url: str, output_path: Path, crs: str = "EPSG:25832"
+    city_name: str, base_url: str, output_path: Path
 ) -> gpd.GeoDataFrame:
     """
     Lädt Daten über OGC API Features (Hamburg).
-
-    Args:
-        city_name: Stadtname
-        base_url: OGC API Features Items-Endpunkt
-        output_path: Ausgabepfad für GeoPackage
-        crs: Ziel-CRS für die Daten
-
-    Returns:
-        GeoDataFrame mit Baumkatasterdaten
     """
     print(f"\n{'=' * 60}")
     print(f"Downloading: {city_name} (OGC API Features)")
     print(f"{'=' * 60}")
 
     all_features: list[dict] = []
-    limit = 10000  # Maximale Features pro Request
+    limit = 10000
     offset = 0
+    crs_param = "http://www.opengis.net/def/crs/EPSG/0/25832"
 
     # Pagination durch alle Features
     while True:
-        url = f"{base_url}?f=json&limit={limit}&offset={offset}&crs=http://www.opengis.net/def/crs/EPSG/0/25832"
+        url = f"{base_url}?f=json&limit={limit}&offset={offset}&crs={crs_param}"
         print(f"Fetching offset={offset}...")
 
         response = requests.get(url, timeout=300)
         response.raise_for_status()
 
-        data = response.json()
-        features = data.get("features", [])
-
+        features = response.json().get("features", [])
         if not features:
             break
 
         all_features.extend(features)
         offset += limit
 
-        # Abbruch wenn weniger als limit Features zurückkommen
         if len(features) < limit:
             break
 
     print(f"Total features fetched: {len(all_features):,}")
 
     # GeoJSON zu GeoDataFrame konvertieren
-    geojson = {"type": "FeatureCollection", "features": all_features}
-    gdf = gpd.GeoDataFrame.from_features(geojson, crs=crs)
+    gdf = gpd.GeoDataFrame.from_features(
+        {"type": "FeatureCollection", "features": all_features}, crs=TARGET_CRS
+    )
 
     # Speichern
     output_path.parent.mkdir(parents=True, exist_ok=True)
@@ -107,15 +82,6 @@ def download_wfs(
 ) -> gpd.GeoDataFrame:
     """
     Lädt Baumkataster über WFS GetFeature herunter.
-
-    Args:
-        city_name: Stadtname
-        wfs_url: WFS-Service-Endpunkt
-        layers: Liste der Layer-Namen oder None für ersten Layer
-        output_path: Ausgabepfad für GeoPackage
-
-    Returns:
-        GeoDataFrame mit Baumkatasterdaten
     """
     print(f"\n{'=' * 60}")
     print(f"Downloading: {city_name} (WFS)")
@@ -145,17 +111,17 @@ def download_wfs(
             typename=layer_name, outputFormat="application/gml+xml; version=3.2"
         )
         gdf = gpd.read_file(response)
-        gdf["source_layer"] = layer_name  # Herkunft merken
+        gdf["source_layer"] = layer_name
         gdfs.append(gdf)
         print(f"  ✓ {len(gdf):,} features from {layer_name}")
 
     # Alle Layer zusammenführen
-    if len(gdfs) == 0:
+    if not gdfs:
         raise ValueError(f"No layers could be downloaded for {city_name}")
-    elif len(gdfs) == 1:
-        gdf_combined = gdfs[0]
-    else:
-        gdf_combined = gpd.GeoDataFrame(pd.concat(gdfs, ignore_index=True))
+    
+    gdf_combined = gdfs[0] if len(gdfs) == 1 else gpd.GeoDataFrame(pd.concat(gdfs, ignore_index=True))
+    
+    if len(gdfs) > 1:
         print(f"✓ Combined {len(gdfs)} layers: {len(gdf_combined):,} total features")
 
     # Speichern
@@ -171,35 +137,26 @@ def download_wfs(
 def download_tree_cadastre(city_name: str, config: dict, output_path: Path) -> gpd.GeoDataFrame:
     """
     Lädt Baumkataster basierend auf Stadtkonfiguration.
-
-    Args:
-        city_name: Stadtname
-        config: Konfiguration mit type, url, etc.
-        output_path: Ausgabepfad für GeoPackage
-
-    Returns:
-        GeoDataFrame mit Baumkatasterdaten
     """
-    if config["type"] == "ogc_api_features":
-        return download_ogc_api_features(
-            city_name, config["url"], output_path, config.get("crs", "EPSG:25832")
-        )
-    elif config["type"] == "wfs":
-        return download_wfs(city_name, config["url"], config.get("layers"), output_path)
-    else:
-        raise ValueError(f"Unknown download type: {config['type']}")
+    download_func = {
+        "ogc_api_features": lambda: download_ogc_api_features(
+            city_name, config["url"], output_path
+        ),
+        "wfs": lambda: download_wfs(
+            city_name, config["url"], config.get("layers"), output_path
+        ),
+    }
+    
+    download_type = config["type"]
+    if download_type not in download_func:
+        raise ValueError(f"Unknown download type: {download_type}")
+    
+    return download_func[download_type]()
 
 
 def extract_schema(gdf: gpd.GeoDataFrame, city_name: str) -> dict:
     """
     Extrahiert vollständiges Spalten-Schema mit Metadaten.
-
-    Args:
-        gdf: GeoDataFrame mit Baumkatasterdaten
-        city_name: Stadtname
-
-    Returns:
-        Schema-Dictionary mit Datentypen, Beispielwerten, Null-Counts
     """
     schema = {
         "city": city_name,
@@ -211,17 +168,21 @@ def extract_schema(gdf: gpd.GeoDataFrame, city_name: str) -> dict:
         "columns": [],
     }
 
+    total_rows = len(gdf)
+
     for col in gdf.columns:
         if col == "geometry":
             continue
 
+        null_count = gdf[col].isnull().sum()
+        
         col_info = {
             "name": col,
             "dtype": str(gdf[col].dtype),
-            "total_values": len(gdf),
-            "non_null_count": int(gdf[col].count()),
-            "null_count": int(gdf[col].isnull().sum()),
-            "null_percentage": round(gdf[col].isnull().sum() / len(gdf) * 100, 2),
+            "total_values": total_rows,
+            "non_null_count": int(total_rows - null_count),
+            "null_count": int(null_count),
+            "null_percentage": round(null_count / total_rows * 100, 2),
             "unique_count": int(gdf[col].nunique()),
             "sample_values": [],
         }
@@ -229,13 +190,9 @@ def extract_schema(gdf: gpd.GeoDataFrame, city_name: str) -> dict:
         # Beispielwerte (erste 10 nicht-null eindeutige Werte)
         non_null = gdf[col].dropna()
         if len(non_null) > 0:
-            unique_samples = non_null.unique()[:10]
-            # NumPy-Typen und booleans in native Python-Typen konvertieren für JSON
             sample_values = []
-            for x in unique_samples:
-                if isinstance(x, (np.integer, np.floating, np.ndarray)):
-                    sample_values.append(str(x))
-                elif isinstance(x, (bool, np.bool_)):
+            for x in non_null.unique()[:10]:
+                if isinstance(x, (np.integer, np.floating, np.ndarray, bool, np.bool_)):
                     sample_values.append(str(x))
                 else:
                     sample_values.append(x)
@@ -249,18 +206,9 @@ def extract_schema(gdf: gpd.GeoDataFrame, city_name: str) -> dict:
 def generate_summary_report(schemas: dict, output_path: Path) -> pd.DataFrame:
     """
     Erstellt stadtübergreifende Spalten-Vergleichstabelle.
-
-    Args:
-        schemas: Dictionary {city_name: schema_dict}
-        output_path: CSV-Ausgabepfad
-
-    Returns:
-        DataFrame mit Spaltenvergleich
     """
     # Alle eindeutigen Spaltennamen über alle Städte sammeln
-    all_columns: set[str] = set()
-    for schema in schemas.values():
-        all_columns.update([col["name"] for col in schema["columns"]])
+    all_columns = {col["name"] for schema in schemas.values() for col in schema["columns"]}
 
     # Vergleichsmatrix aufbauen
     comparison = []
@@ -268,7 +216,6 @@ def generate_summary_report(schemas: dict, output_path: Path) -> pd.DataFrame:
         row = {"column_name": col_name}
 
         for city, schema in schemas.items():
-            # Spalte in dieser Stadt suchen
             col_data = next(
                 (c for c in schema["columns"] if c["name"] == col_name),
                 None,
@@ -279,15 +226,12 @@ def generate_summary_report(schemas: dict, output_path: Path) -> pd.DataFrame:
                 row[f"{city}_null%"] = col_data["null_percentage"]
                 row[f"{city}_unique"] = col_data["unique_count"]
             else:
-                row[f"{city}_dtype"] = "N/A"
-                row[f"{city}_null%"] = "N/A"
-                row[f"{city}_unique"] = "N/A"
+                row[f"{city}_dtype"] = row[f"{city}_null%"] = row[f"{city}_unique"] = "N/A"
 
         comparison.append(row)
 
     df = pd.DataFrame(comparison)
     df.to_csv(output_path, index=False)
-
     print(f"\n✓ Summary report saved: {output_path}")
 
     return df
@@ -308,13 +252,12 @@ def print_schema_summary(schema: dict) -> None:
     print(f"COLUMNS ({len(schema['columns'])} total):")
     print(f"{'-' * 80}")
 
-    # Tabellenkopf
     header = f"{'Column Name':<35} {'Type':<12} {'Nulls%':<8} {'Unique':<10} {'Sample Values'}"
     print(header)
     print(f"{'-' * 80}")
 
     for col in schema["columns"]:
-        sample_preview = str(col["sample_values"][:3])[:35] + "..."
+        sample_preview = f"{str(col['sample_values'][:3])}..."[:38]
         print(
             f"{col['name']:<35} "
             f"{col['dtype']:<12} "
@@ -327,13 +270,6 @@ def print_schema_summary(schema: dict) -> None:
 def validate_download(gdf: gpd.GeoDataFrame, city_name: str) -> bool:
     """
     Validiert heruntergeladene Daten.
-
-    Args:
-        gdf: GeoDataFrame mit Baumkatasterdaten
-        city_name: Stadtname
-
-    Returns:
-        True wenn Validierung erfolgreich
     """
     issues = []
 
@@ -345,10 +281,10 @@ def validate_download(gdf: gpd.GeoDataFrame, city_name: str) -> bool:
     if gdf.crs is None:
         issues.append("Missing CRS")
 
-    # Geometrie-Spalte prüfen
+    # Geometrie-Spalte und Geometrie-Typen prüfen
     if "geometry" not in gdf.columns:
         issues.append("Missing geometry column")
-    elif not all(gdf.geometry.type.isin(["Point", "MultiPoint"])):
+    elif not gdf.geometry.type.isin(["Point", "MultiPoint"]).all():
         issues.append(f"Unexpected geometry types: {gdf.geometry.type.unique().tolist()}")
 
     if issues:
@@ -367,15 +303,20 @@ def main() -> None:
     print("Baumkataster-Download und Schema-Extraktion")
     print("=" * 60)
 
-    METADATA_DIR.mkdir(parents=True, exist_ok=True)
+    TREE_CADASTRES_METADATA_DIR.mkdir(parents=True, exist_ok=True)
 
     schemas: dict[str, dict] = {}
 
     # Download und Schema-Extraktion für jede Stadt
-    for city, config in CITY_CONFIG.items():
+    for city in CITIES:
+        config = TREE_CADASTRE_CONFIG.get(city)
+        if not config:
+            print(f"⚠ No config found for {city}")
+            continue
+            
         try:
             # Download
-            output_file = RAW_DIR / f"{city.lower()}_trees_raw.gpkg"
+            output_file = TREE_CADASTRES_RAW_DIR / f"{city.lower()}_trees_raw.gpkg"
             gdf = download_tree_cadastre(city, config, output_file)
 
             # Validierung
@@ -386,10 +327,8 @@ def main() -> None:
             schemas[city] = schema
 
             # Einzelnes Schema-JSON speichern
-            schema_file = METADATA_DIR / f"{city.lower()}_schema.json"
-            with open(schema_file, "w", encoding="utf-8") as f:
-                json.dump(schema, f, indent=2, ensure_ascii=False)
-
+            schema_file = TREE_CADASTRES_METADATA_DIR / f"{city.lower()}_schema.json"
+            schema_file.write_text(json.dumps(schema, indent=2, ensure_ascii=False), encoding="utf-8")
             print(f"✓ Schema saved: {schema_file}")
 
             # Auf Konsole ausgeben
@@ -397,11 +336,10 @@ def main() -> None:
 
         except Exception as e:
             print(f"✗ Error processing {city}: {e}")
-            continue
 
     # Stadtübergreifenden Vergleich generieren
     if schemas:
-        summary_file = METADATA_DIR / "schema_summary.csv"
+        summary_file = TREE_CADASTRES_METADATA_DIR / "schema_summary.csv"
         generate_summary_report(schemas, summary_file)
 
         # Zusammenfassungsstatistiken ausgeben

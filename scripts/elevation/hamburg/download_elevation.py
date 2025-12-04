@@ -30,7 +30,7 @@ DGM_URL = (
     "Digitales_Hoehenmodell/DGM1/dgm1_2x2km_XYZ_hh_2021_04_01.zip"
 )
 BOUNDARIES_PATH = Path("data/boundaries/city_boundaries_500m_buffer.gpkg")
-OUTPUT_DIR = Path("data/raw/hamburg")
+OUTPUT_DIR = Path("data/CHM/raw/hamburg")
 CRS = "EPSG:25832"
 MAX_RETRIES = 3
 
@@ -179,7 +179,6 @@ def mosaic_with_gdalwarp(
 
     # Create VRT from all tiles
     temp_vrt = output_path.parent / f"{output_path.stem}_temp.vrt"
-    temp_mosaic = output_path.parent / f"{output_path.stem}_temp.tif"
 
     # Build VRT
     vrt_cmd = ["gdalbuildvrt", str(temp_vrt)] + [str(p) for p in geotiff_paths]
@@ -211,7 +210,7 @@ def mosaic_with_gdalwarp(
 
     try:
         subprocess.run(warp_cmd, check=True, capture_output=True, timeout=1800)
-        logger.info(f"Warped and clipped to boundary")
+        logger.info("Warped and clipped to boundary")
     except subprocess.CalledProcessError as e:
         logger.error(f"Gdalwarp failed: {e.stderr.decode()}")
         raise
@@ -405,7 +404,7 @@ def process_elevation_data(
 def main() -> None:
     """Hauptfunktion: Lädt und verarbeitet Höhendaten für Hamburg."""
     logger.info("=" * 70)
-    logger.info(f"Hamburg Elevation Data Download - DOM & DGM")
+    logger.info("Hamburg Elevation Data Download - DOM & DGM")
     logger.info("=" * 70)
 
     # Setup

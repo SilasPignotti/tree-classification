@@ -9,6 +9,69 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **Multiple edge filter variants** for tree cadastre filtering:
+  - `edge_15m`: 363.571 trees, 8 genera (standard)
+  - `edge_20m`: 280.524 trees, 7 genera
+  - `edge_30m`: 195.118 trees, 6 genera
+  - Enables trade-off analysis between sample size and spectral purity
+- Power analysis documentation for 500-sample threshold in `05_Baumfilterung_Methodik.md`
+
+- Sentinel-2 coverage validation script (`scripts/sentinel2/validate_coverage.py`):
+  - Creates CSV report with quality metrics for all Sentinel-2 files
+  - Metrics: cloud-free coverage (%), band count, file size, resolution, CRS, data range
+  - Coverage calculated relative to city geometry (not BBox)
+  - Summary statistics per city with problem month identification
+  - **Output**: `data/sentinel2/coverage_report.csv`
+  - **Results**: Hamburg 84.5% mean, Berlin 92.0% mean, Rostock 96.1% mean coverage
+  - **Problem months**: Hamburg Dec (17.1%), Berlin Nov (21.1%)
+
+### Changed
+
+- **Tree filter now treats NaN-genus trees as contamination sources**:
+  - Trees without genus are included in edge distance calculation
+  - A known-genus tree near a NaN-genus tree is filtered out
+  - NaN-genus trees themselves are not exported
+  - 14.282 NaN-genus trees affect edge calculations
+- CHM quality filters now set negative values to NoData instead of 0:
+  - **Rationale**: Negative CHM values indicate water, bridges, or interpolation errors - not vegetation
+  - Setting to 0 artificially skewed statistics (median was 0.26m instead of realistic ~8m)
+  - Now: negative values → NoData, outliers >60m → NoData
+  - Expected mean ranges updated: 500m Buffer 4-25m, City Core 6-30m
+- CHM statistics now use geometry-based valid_percent calculation:
+  - `compute_statistics()` accepts optional `reference_mask` parameter
+  - Valid percent calculated as `valid_in_geometry / pixels_in_geometry` (not BBox)
+  - New `create_geometry_mask()` helper function
+  - `mask_to_city_core()` now returns tuple (masked_chm, geometry_mask)
+  - Process steps increased from 8 to 9 (added "Geometrie-Masken erstellen")
+  - Output now shows "Valid: XX.X%" in console
+- Sentinel-2 download script CRS and clipping improvements:
+  - Added `reproject_and_clip()` function for local CRS conversion (EPSG:32632 → EPSG:25832)
+  - Clips output to city boundary geometry (not just BBox)
+  - `validate_output()` now accepts `city_geometry` parameter for correct cloud-free calculation
+  - Cloud-free coverage now calculated relative to city geometry pixels
+
+### Fixed
+
+- CHM JSON serialization error (`TypeError: Object of type int64 is not JSON serializable`):
+  - Added `int()` cast for numpy int64 values in `compute_statistics()` and `apply_quality_filters()`
+  - Added `round()` for cleaner float output
+- Sentinel-2 validation showed misleading "valid pixel" percentages:
+  - Previously: ~52.8% for Hamburg (actually city boundary coverage within BBox)
+  - Now: Shows true cloud-free coverage (e.g., Jan: 100%, Dec: 17.1%)
+- CHM valid_percent calculation used BBox instead of city geometry:
+  - Previously: `valid_count / chm.size` (underestimated actual coverage)
+  - Now: `valid_in_geometry / pixels_in_geometry` (correct coverage metric)
+
+### Removed
+
+- Temporary diagnostic scripts: `scripts/chm/analyze_alignment.py`, `scripts/chm/chm_diagnostic_report.py`
+
+---
+
+## [0.6.0] - 2025-12-02
+
+### Added
+
 - Initial project structure with data directories (`data/raw/`, `data/processed/`, `data/boundaries/`), scripts, notebooks, and docs
 - UV virtual environment setup for dependency management
 - Restructured scripts into city-specific subfolders:
@@ -117,24 +180,45 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   - **Viable genera (edge_15m)**: ACER, BETULA, FRAXINUS, POPULUS, PRUNUS, QUERCUS, SORBUS, TILIA
   - **Metadata exports**: `genus_viability_{variant}.csv`, `all_genera_counts_{variant}.csv`, `filtering_losses_{variant}.csv`, `filtering_report_{variant}.json`
   - **Filtering losses**: 1.5% temporal, 0.5% spatial, 6.7%/22.4% genus viability (no_edge/edge_15m)
-- Dependencies: `geopandas`, `requests`, `matplotlib`, `rasterio`, `feedparser`, `tqdm`, `numpy`, `pandas`, `openeo`, `jupyter`, `jupyterlab`, `owslib`, `scipy`
-
-### Changed
-
-- N/A
-
-### Deprecated
-
-- N/A
-
-### Removed
-
-- N/A
-
-### Fixed
-
-- N/A
-
-### Security
-
-- N/A
+- Data validation script (`scripts/validation/validate_data.py`):
+  - Pre-feature-extraction quality checks for spatial alignment and data consistency
+  - **Priority 0 - CRS & Projection Validation**:
+    - Check 0.1: Input CRS verification (verifies CHM EPSG:25832, S2/cadastre EPSG:32632)
+    - Check 0.2: CRS consistency check (validates project uses EPSG:32632 throughout)
+  - **Priority 0.5 - Extended CHM Resampling**:
+    - Check 0.3: CHM resampling to 10m with three aggregation methods (mean, max, std)
+    - Generates `CHM_10m_mean_{city}.tif`, `CHM_10m_max_{city}.tif`, `CHM_10m_std_{city}.tif`
+    - STD computed via variance formula: sqrt(E[X²] - E[X]²)
+  - **Priority 0.75 - Spatial Alignment Verification**:
+    - Check 0.4: Correlation-based offset detection (-20m to +20m in 10m steps)
+    - Check 0.5: Tree point NDVI-CHM correlation (hexbin scatterplots)
+    - Check 0.6: Transect profile analysis (3 transects per city through known parks)
+    - Check 0.7: Known-feature validation (park bounding boxes with CHM/NDVI thresholds)
+  - **Priority 1 - Critical Checks (STOPPERS)**:
+    - Check 1.1: CHM ↔ Sentinel-2 grid alignment (resamples CHM 1m → 10m matching S2 grid)
+    - Check 1.2: CHM plausibility at tree points (compares CHM_mean vs CHM_max)
+  - **Priority 2 - Informative Checks**:
+    - Check 2.1: Visual spot checks (9 random 500m² tiles with CHM, NDVI, tree points overlay)
+    - Check 2.2: Height correlation (cadastre height vs. CHM height for Berlin/Rostock)
+    - Check 2.3: Temporal consistency (S2 monthly reflectance patterns, summer/winter NIR ratio)
+  - **Priority 3 - Ablation Preparation**:
+    - Check 3.2: Band correlation sanity check (10-band correlation matrix)
+  - **Output files**:
+    - `data/CHM/processed/CHM_10m/CHM_10m_{mean,max,std}_{City}.tif` - CHM variants at 10m resolution
+    - `data/validation/crs_verification_report.csv` - CRS verification results
+    - `data/validation/chm_resampling_extended_report.csv` - Resampling statistics
+    - `data/validation/offset_detection_{City}.png` - Offset correlation heatmaps
+    - `data/validation/offset_detection_results.csv` - Offset detection metrics
+    - `data/validation/tree_point_correlation_{City}.png` - NDVI-CHM scatterplots
+    - `data/validation/tree_point_correlation_stats.csv` - Correlation statistics
+    - `data/validation/transect_{City}_t{1-3}.png` - Transect profile plots
+    - `data/validation/transect_analysis_results.csv` - Transect peak alignment
+    - `data/validation/known_feature_validation.csv` - Park validation results
+    - `data/validation/grid_alignment_report.json` - Grid alignment metrics
+    - `data/validation/chm_plausibility_stats.csv` - Tree point plausibility statistics
+    - `data/validation/visual_alignment_{city}_tile{1-3}.png` - 9 visual alignment plots
+    - `data/validation/height_correlation_{city}.png` - Height correlation scatterplots
+    - `data/validation/temporal_consistency_{city}.png` - Monthly reflectance time series
+    - `data/validation/band_correlation_heatmap.png` - S2 inter-band correlation matrix
+    - `data/validation/validation_summary_report.md` - Final summary report
+- Dependencies: `geopandas`, `requests`, `matplotlib`, `rasterio`, `feedparser`, `tqdm`, `numpy`, `pandas`, `openeo`, `jupyter`, `jupyterlab`, `owslib`, `scipy`, `seaborn`

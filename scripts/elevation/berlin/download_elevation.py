@@ -30,7 +30,7 @@ CITY = "Berlin"
 DOM_FEED_URL = "https://fbinter.stadt-berlin.de/fb/feed/senstadt/a_dom1"
 DGM_FEED_URL = "https://gdi.berlin.de/data/dgm1/atom"
 BOUNDARIES_PATH = Path("data/boundaries/city_boundaries_500m_buffer.gpkg")
-OUTPUT_DIR = Path("data/raw/berlin")
+OUTPUT_DIR = Path("data/CHM/raw/berlin")
 CRS = "EPSG:25832"
 MAX_RETRIES = 3
 

@@ -2,12 +2,16 @@
 Räumliche Filterung und Gattungs-Viabilitätsbewertung für Baumkataster-Daten.
 
 Wendet zeitliche, räumliche und Gattungs-Filter auf harmonisierte Baumkataster an,
-berechnet Abstände zu Nachbargattungen und exportiert zwei Datensatz-Varianten:
+berechnet Abstände zu Nachbargattungen und exportiert mehrere Datensatz-Varianten:
 1. Ohne Kantenfilterung (maximale Stichprobe)
-2. Mit 15m Kantenfilterung (Qualitätsfilterung)
+2. Mit 15m/20m/30m Kantenfilterung (verschiedene Qualitätsstufen)
+
+Bäume ohne Gattungsangabe (NaN) werden in separaten Dateien für potenzielle
+spätere Nutzung exportiert.
 """
 
 import json
+import sys
 from pathlib import Path
 
 import geopandas as gpd
@@ -15,18 +19,17 @@ import numpy as np
 import pandas as pd
 from scipy.spatial import cKDTree
 
-
-# Konstanten
-BASE_DIR = Path("data/tree_cadastres")
-PROCESSED_DIR = BASE_DIR / "processed"
-METADATA_DIR = BASE_DIR / "metadata"
-BOUNDARIES_PATH = Path("data/boundaries/city_boundaries.gpkg")
-
-TARGET_CRS = "EPSG:25832"
-CHM_REFERENCE_YEAR = 2021
-MIN_SAMPLES_PER_CITY = 500
-EDGE_DISTANCE_THRESHOLD_M = 15
-GRID_CELL_SIZE_M = 1000
+sys.path.insert(0, str(Path(__file__).parent.parent))
+from config import (
+    BOUNDARIES_PATH,
+    CHM_REFERENCE_YEAR,
+    CITIES,
+    EDGE_DISTANCE_THRESHOLDS_M,
+    GRID_CELL_SIZE_M,
+    MIN_SAMPLES_PER_CITY,
+    TREE_CADASTRES_METADATA_DIR,
+    TREE_CADASTRES_PROCESSED_DIR,
+)
 
 
 def temporal_filter(gdf: gpd.GeoDataFrame) -> tuple[gpd.GeoDataFrame, dict]:
@@ -34,19 +37,12 @@ def temporal_filter(gdf: gpd.GeoDataFrame) -> tuple[gpd.GeoDataFrame, dict]:
     Filtert Bäume nach Pflanzjahr (≤ CHM-Referenzjahr).
 
     Behält Bäume mit plant_year ≤ 2021 oder unbekanntem Pflanzjahr (NaN).
-
-    Args:
-        gdf: GeoDataFrame mit harmonisierten Baumdaten
-
-    Returns:
-        Tuple aus gefiltertem GeoDataFrame und Loss-Dictionary
     """
-    filtered = gdf[
-        (gdf["plant_year"].isna()) | (gdf["plant_year"] <= CHM_REFERENCE_YEAR)
-    ].copy()
+    mask = gdf["plant_year"].isna() | (gdf["plant_year"] <= CHM_REFERENCE_YEAR)
+    filtered = gdf[mask].copy()
 
     loss = len(gdf) - len(filtered)
-    loss_pct = loss / len(gdf) * 100 if len(gdf) > 0 else 0.0
+    loss_pct = (loss / len(gdf) * 100) if len(gdf) > 0 else 0.0
 
     print(f"  ✓ Retained: {len(filtered):,} trees")
     print(f"  ✗ Excluded: {loss:,} ({loss_pct:.1f}%)")
@@ -58,39 +54,19 @@ def temporal_filter(gdf: gpd.GeoDataFrame) -> tuple[gpd.GeoDataFrame, dict]:
     }
 
 
-def clip_to_city_core(
-    gdf: gpd.GeoDataFrame, boundaries_path: Path
-) -> tuple[gpd.GeoDataFrame, dict]:
+def clip_to_city_core(gdf: gpd.GeoDataFrame) -> tuple[gpd.GeoDataFrame, dict]:
     """
     Clippt Bäume auf Stadtgrenzen (ohne 500m-Puffer).
-
-    Args:
-        gdf: GeoDataFrame mit Baumdaten
-        boundaries_path: Pfad zur city_boundaries.gpkg
-
-    Returns:
-        Tuple aus geclipptem GeoDataFrame und Loss-Dictionary
     """
-    # Grenzen laden (ohne Buffer)
-    boundaries = gpd.read_file(boundaries_path)
+    boundaries = gpd.read_file(BOUNDARIES_PATH)
 
-    # CRS angleichen falls nötig
-    if gdf.crs != boundaries.crs:
-        boundaries = boundaries.to_crs(gdf.crs)
-
-    # Spatial Join: nur Bäume innerhalb der Grenzen behalten
     gdf_clipped = gpd.sjoin(
         gdf,
-        boundaries[["gen", "geometry"]],
+        boundaries[["geometry"]],
         how="inner",
         predicate="within",
-    )
-
-    # Join-Artefakte bereinigen
-    gdf_clipped = gdf_clipped.drop(columns=["index_right"], errors="ignore")
-    gdf_clipped = gdf_clipped.drop(columns=["gen"], errors="ignore")
-
-    # Duplikate entfernen (sollte nicht vorkommen)
+    ).drop(columns=["index_right"], errors="ignore")
+    
     gdf_clipped = gdf_clipped.drop_duplicates(subset=["tree_id"])
 
     loss = len(gdf) - len(gdf_clipped)
@@ -111,45 +87,56 @@ def calculate_edge_distances(gdf: gpd.GeoDataFrame) -> gpd.GeoDataFrame:
     Berechnet für jeden Baum den Abstand zum nächsten Baum einer anderen Gattung.
 
     Verwendet KD-Tree für effiziente O(n log n) Performance.
-
-    Args:
-        gdf: GeoDataFrame mit Baumdaten
-
-    Returns:
-        GeoDataFrame mit neuer Spalte 'min_dist_other_genus'
+    
+    WICHTIG: Bäume ohne Gattung (NaN) werden als potenzielle Kontaminationsquellen
+    behandelt - sie zählen als "fremde" Bäume für alle bekannten Gattungen.
     """
     print("\n  Calculating edge distances (KD-Tree per genus)...")
+    print("  ℹ️  NaN-genus trees are treated as contamination sources")
 
     gdf = gdf.copy()
     gdf["min_dist_other_genus"] = np.nan
 
-    genera = gdf["genus_latin"].dropna().unique()
-    total_genera = len(genera)
+    # Trennung: mit/ohne Gattung
+    has_genus = gdf["genus_latin"].notna()
+    gdf_with_genus = gdf[has_genus]
+    gdf_nan_genus = gdf[~has_genus]
+    
+    print(f"  ℹ️  Trees with genus: {len(gdf_with_genus):,}")
+    print(f"  ℹ️  Trees without genus (as contamination): {len(gdf_nan_genus):,}")
 
-    for i, genus in enumerate(genera, 1):
+    # Prepare coordinates once
+    nan_coords = np.column_stack([gdf_nan_genus.geometry.x, gdf_nan_genus.geometry.y]) if len(gdf_nan_genus) > 0 else None
+    genera_list = gdf_with_genus["genus_latin"].unique()
+    total_genera = len(genera_list)
+
+    for i, genus in enumerate(genera_list, 1):
         # Bäume dieser Gattung
-        same_genus_mask = gdf["genus_latin"] == genus
-        same_genus = gdf[same_genus_mask]
+        genus_idx = gdf_with_genus["genus_latin"] == genus
+        genus_trees = gdf_with_genus[genus_idx]
+        genus_indices = gdf_with_genus.index[genus_idx]
 
-        # Bäume anderer Gattungen
-        other_genus = gdf[~same_genus_mask & gdf["genus_latin"].notna()]
-
-        if len(other_genus) == 0:
-            # Keine anderen Gattungen in der Nähe (unwahrscheinlich)
-            gdf.loc[same_genus.index, "min_dist_other_genus"] = np.inf
+        # "Fremde" Bäume = andere bekannte Gattungen + NaN-Bäume
+        other_known = gdf_with_genus[~genus_idx]
+        
+        if len(other_known) == 0 and (nan_coords is None or len(nan_coords) == 0):
+            gdf.loc[genus_indices, "min_dist_other_genus"] = np.inf
             continue
 
-        # KD-Tree für schnelle Nearest-Neighbor-Suche
-        coords_other = np.column_stack([other_genus.geometry.x, other_genus.geometry.y])
+        # Combine coordinates
+        coords_list = [np.column_stack([other_known.geometry.x, other_known.geometry.y])]
+        if nan_coords is not None and len(nan_coords) > 0:
+            coords_list.append(nan_coords)
+        
+        coords_other = np.vstack(coords_list) if len(coords_list) > 1 else coords_list[0]
         tree = cKDTree(coords_other)
 
-        # Query: Abstand zum nächsten "fremden" Baum
-        coords_same = np.column_stack([same_genus.geometry.x, same_genus.geometry.y])
+        # Query distances
+        coords_same = np.column_stack([genus_trees.geometry.x, genus_trees.geometry.y])
         distances, _ = tree.query(coords_same, k=1)
 
-        gdf.loc[same_genus.index, "min_dist_other_genus"] = distances
+        gdf.loc[genus_indices, "min_dist_other_genus"] = distances
 
-        # Fortschritt alle 10 Gattungen
         if i % 10 == 0 or i == total_genera:
             print(f"    ✓ Processed {i}/{total_genera} genera")
 
@@ -157,22 +144,16 @@ def calculate_edge_distances(gdf: gpd.GeoDataFrame) -> gpd.GeoDataFrame:
 
 
 def apply_edge_filter(
-    gdf: gpd.GeoDataFrame, min_distance_m: float = EDGE_DISTANCE_THRESHOLD_M
+    gdf: gpd.GeoDataFrame, min_distance_m: float
 ) -> tuple[gpd.GeoDataFrame, dict]:
     """
     Behält nur Bäume mit ≥ min_distance_m Abstand zu anderen Gattungen.
-
-    Args:
-        gdf: GeoDataFrame mit 'min_dist_other_genus' Spalte
-        min_distance_m: Minimaler Abstandsschwellenwert (Standard: 15m)
-
-    Returns:
-        Tuple aus gefiltertem GeoDataFrame und Loss-Dictionary
     """
-    filtered = gdf[gdf["min_dist_other_genus"] >= min_distance_m].copy()
+    mask = gdf["min_dist_other_genus"] >= min_distance_m
+    filtered = gdf[mask].copy()
 
     loss = len(gdf) - len(filtered)
-    loss_pct = loss / len(gdf) * 100 if len(gdf) > 0 else 0.0
+    loss_pct = (loss / len(gdf) * 100) if len(gdf) > 0 else 0.0
 
     print(f"  ✓ Retained: {len(filtered):,} trees")
     print(f"  ✗ Excluded: {loss:,} ({loss_pct:.1f}%)")
@@ -189,32 +170,19 @@ def check_genus_viability(
 ) -> tuple[list[str], pd.DataFrame, pd.DataFrame]:
     """
     Ermittelt Gattungen mit ≥ min_samples in ALLEN drei Städten.
-
-    Args:
-        gdf: GeoDataFrame mit Baumdaten
-        min_samples: Minimum Stichproben pro Stadt (Standard: 500)
-
-    Returns:
-        Tuple aus:
-        - Liste vieler Gattungen
-        - DataFrame mit Statistiken für viable Gattungen
-        - DataFrame mit allen Gattungszählungen
     """
-    # Zählung pro Stadt × Gattung (rows=cities, cols=genera nach unstack)
-    counts_raw = gdf.groupby(["city", "genus_latin"]).size().unstack(fill_value=0)
+    # Zählung pro Stadt × Gattung, transponiert zu rows=genera, cols=cities
+    counts = gdf.groupby(["city", "genus_latin"]).size().unstack(fill_value=0).T
 
-    # Transponieren: rows=genera, cols=cities
-    counts = counts_raw.T
+    # Filter zu verfügbaren Städten
+    available_cities = [c for c in CITIES if c in counts.columns]
 
     # Viable = erfüllt Schwellenwert in ALLEN Städten
-    expected_cities = ["Berlin", "Hamburg", "Rostock"]
-    available_cities = [c for c in expected_cities if c in counts.columns]
-
     viable_mask = (counts[available_cities] >= min_samples).all(axis=1)
     viable_genera = sorted(counts[viable_mask].index.tolist())
 
     # Statistiken für viable Gattungen
-    if len(viable_genera) > 0:
+    if viable_genera:
         viable_stats = counts.loc[viable_genera].copy()
         viable_stats["total"] = viable_stats[available_cities].sum(axis=1)
         viable_stats["min_city"] = viable_stats[available_cities].min(axis=1)
@@ -226,13 +194,9 @@ def check_genus_viability(
     print(f"\n  ✓ Viable genera (≥{min_samples} per city): {len(viable_genera)}")
     if viable_genera:
         print(f"    → {', '.join(viable_genera)}")
-
-    if len(viable_stats) > 0:
+    if not viable_stats.empty:
         print("\n  Sample counts:")
-        display_cols = available_cities + ["total", "min_city"]
-        print(viable_stats[display_cols].to_string())
-
-    return viable_genera, viable_stats, counts
+        print(viable_stats[available_cities + ["total", "min_city"]].to_string())
 
     return viable_genera, viable_stats, counts
 
@@ -242,18 +206,12 @@ def filter_viable_genera(
 ) -> tuple[gpd.GeoDataFrame, dict]:
     """
     Behält nur Bäume der viablen Gattungen.
-
-    Args:
-        gdf: GeoDataFrame mit Baumdaten
-        viable_genera: Liste der viablen Gattungsnamen
-
-    Returns:
-        Tuple aus gefiltertem GeoDataFrame und Loss-Dictionary
     """
-    filtered = gdf[gdf["genus_latin"].isin(viable_genera)].copy()
+    mask = gdf["genus_latin"].isin(viable_genera)
+    filtered = gdf[mask].copy()
 
     loss = len(gdf) - len(filtered)
-    loss_pct = loss / len(gdf) * 100 if len(gdf) > 0 else 0.0
+    loss_pct = (loss / len(gdf) * 100) if len(gdf) > 0 else 0.0
 
     print(f"\n  ✓ Retained: {len(filtered):,} trees ({len(viable_genera)} genera)")
     print(f"  ✗ Excluded: {loss:,} trees ({loss_pct:.1f}%)")
@@ -271,15 +229,10 @@ def create_spatial_grid(
 ) -> gpd.GeoDataFrame:
     """
     Weist jeden Baum einer Gitterzelle zu für späteres räumliches Sampling.
-
-    Args:
-        gdf: GeoDataFrame mit Baumdaten
-        cell_size_m: Gitterzellengröße in Metern (Standard: 1000 = 1km × 1km)
-
-    Returns:
-        GeoDataFrame mit neuen Spalten 'grid_x', 'grid_y', 'grid_id'
     """
     gdf = gdf.copy()
+    
+    # Vectorized grid assignment
     gdf["grid_x"] = (gdf.geometry.x // cell_size_m).astype(int)
     gdf["grid_y"] = (gdf.geometry.y // cell_size_m).astype(int)
     gdf["grid_id"] = gdf["grid_x"].astype(str) + "_" + gdf["grid_y"].astype(str)
@@ -293,7 +246,7 @@ def create_spatial_grid(
     print(f"    Avg trees/cell: {avg_trees_per_cell:.1f}")
 
     # Pro-Stadt Statistiken
-    for city in sorted(gdf["city"].unique()):
+    for city in gdf["city"].unique():
         city_data = gdf[gdf["city"] == city]
         city_cells = city_data["grid_id"].nunique()
         city_avg = len(city_data) / city_cells if city_cells > 0 else 0
@@ -303,21 +256,13 @@ def create_spatial_grid(
 
 
 def export_filtered_dataset(
-    gdf: gpd.GeoDataFrame, variant_name: str, output_dir: Path = PROCESSED_DIR
+    gdf: gpd.GeoDataFrame, variant_name: str
 ) -> Path:
     """
     Exportiert gefilterten Datensatz als GeoPackage.
-
-    Args:
-        gdf: GeoDataFrame mit gefilterten Baumdaten
-        variant_name: 'no_edge' oder 'edge_15m'
-        output_dir: Ausgabeverzeichnis
-
-    Returns:
-        Pfad zur exportierten Datei
     """
-    output_path = output_dir / f"trees_filtered_viable_{variant_name}.gpkg"
-    output_dir.mkdir(parents=True, exist_ok=True)
+    output_path = TREE_CADASTRES_PROCESSED_DIR / f"trees_filtered_viable_{variant_name}.gpkg"
+    TREE_CADASTRES_PROCESSED_DIR.mkdir(parents=True, exist_ok=True)
 
     # Finale Spalten auswählen
     columns = [
@@ -337,7 +282,7 @@ def export_filtered_dataset(
         "geometry",
     ]
 
-    gdf_export = gdf[columns].copy()
+    gdf_export = gdf[columns]
 
     # Speichern
     gdf_export.to_file(output_path, driver="GPKG")
@@ -361,48 +306,43 @@ def export_metadata(
 ) -> None:
     """
     Exportiert Metadaten-CSVs und JSON-Bericht.
-
-    Args:
-        viable_stats: Statistiken für viable Gattungen
-        all_genus_counts: Zählungen für alle Gattungen
-        filtering_losses: Liste der Loss-Dictionaries pro Filterschritt
-        variant_name: 'no_edge' oder 'edge_15m'
     """
-    METADATA_DIR.mkdir(parents=True, exist_ok=True)
+    TREE_CADASTRES_METADATA_DIR.mkdir(parents=True, exist_ok=True)
 
-    # 1. Viable Genera Statistiken
-    viable_path = METADATA_DIR / f"genus_viability_{variant_name}.csv"
+    # Export CSVs
+    viable_path = TREE_CADASTRES_METADATA_DIR / f"genus_viability_{variant_name}.csv"
     viable_stats.to_csv(viable_path)
     print(f"  ✓ Viable genera stats: {viable_path}")
 
-    # 2. Alle Gattungszählungen (Dokumentation)
-    all_genera_path = METADATA_DIR / f"all_genera_counts_{variant_name}.csv"
+    all_genera_path = TREE_CADASTRES_METADATA_DIR / f"all_genera_counts_{variant_name}.csv"
     all_genus_counts.to_csv(all_genera_path)
     print(f"  ✓ All genera counts: {all_genera_path}")
 
-    # 3. Filtering Losses
     losses_df = pd.DataFrame(filtering_losses)
     losses_df["variant"] = variant_name
-    losses_path = METADATA_DIR / f"filtering_losses_{variant_name}.csv"
+    losses_path = TREE_CADASTRES_METADATA_DIR / f"filtering_losses_{variant_name}.csv"
     losses_df.to_csv(losses_path, index=False)
     print(f"  ✓ Filtering losses: {losses_path}")
 
-    # 4. Summary JSON
+    # Build summary
+    is_empty = len(viable_stats) == 0
+    total_trees = int(viable_stats["total"].sum()) if not is_empty else 0
+    
     summary = {
         "variant": variant_name,
-        "viable_genera": viable_stats.index.tolist() if len(viable_stats) > 0 else [],
+        "viable_genera": viable_stats.index.tolist() if not is_empty else [],
         "viable_genera_count": len(viable_stats),
-        "total_trees": int(viable_stats["total"].sum()) if len(viable_stats) > 0 else 0,
-        "per_city": {},
+        "total_trees": total_trees,
+        "per_city": {
+            city: int(viable_stats[city].sum())
+            for city in ["Hamburg", "Berlin", "Rostock"]
+            if city in viable_stats.columns
+        },
         "filtering_steps": filtering_losses,
     }
 
-    if len(viable_stats) > 0:
-        for city in ["Hamburg", "Berlin", "Rostock"]:
-            if city in viable_stats.columns:
-                summary["per_city"][city] = int(viable_stats[city].sum())
-
-    summary_path = PROCESSED_DIR / f"filtering_report_{variant_name}.json"
+    # Export JSON
+    summary_path = TREE_CADASTRES_PROCESSED_DIR / f"filtering_report_{variant_name}.json"
     with open(summary_path, "w") as f:
         json.dump(summary, f, indent=2, ensure_ascii=False)
     print(f"  ✓ Summary report: {summary_path}")
@@ -416,97 +356,75 @@ def main() -> None:
 
     # Harmonisierte Daten laden
     print("\n[1/7] Loading harmonized data...")
-    input_path = PROCESSED_DIR / "trees_harmonized.gpkg"
+    input_path = TREE_CADASTRES_PROCESSED_DIR / "trees_harmonized.gpkg"
     gdf = gpd.read_file(input_path)
     print(f"  ✓ Loaded: {len(gdf):,} trees")
+    print(f"  ✓ Trees with genus: {gdf['genus_latin'].notna().sum():,}")
+    print(f"  ✓ Trees without genus (NaN): {gdf['genus_latin'].isna().sum():,}")
 
-    # Temporal Filter (für beide Varianten gleich)
+    # Temporal Filter (für alle Varianten gleich)
     print("\n[2/7] Applying temporal filter (plant_year ≤ 2021)...")
     gdf_temporal, loss_temporal = temporal_filter(gdf)
 
-    # City Boundary Clipping (für beide Varianten gleich)
+    # City Boundary Clipping (für alle Varianten gleich)
     print("\n[3/7] Clipping to city core (remove 500m buffer)...")
-    gdf_clipped, loss_clip = clip_to_city_core(gdf_temporal, BOUNDARIES_PATH)
+    gdf_clipped, loss_clip = clip_to_city_core(gdf_temporal)
 
-    # Edge Distances berechnen (für beide Varianten)
+    # Edge Distances berechnen (NaN-Bäume werden als Kontaminationsquellen berücksichtigt)
     print("\n[4/7] Calculating edge distances...")
     gdf_with_distances = calculate_edge_distances(gdf_clipped)
 
-    # Gemeinsame Losses speichern
     shared_losses = [loss_temporal, loss_clip]
+    results_summary = {}
 
-    # ========================================================================
-    # VARIANTE A: Ohne Edge Filter
-    # ========================================================================
-    print("\n" + "=" * 80)
-    print("VARIANT A: NO EDGE FILTER")
-    print("=" * 80)
+    # Helper function to process variants
+    def process_variant(gdf_input, edge_threshold=None):
+        """Process a single variant and return results."""
+        if edge_threshold is None:
+            variant_name = "no_edge"
+            print("\n" + "=" * 80)
+            print("VARIANT A: NO EDGE FILTER")
+            print("=" * 80)
+            print("\n[5/7] Skipping edge filter...")
+            print("  ✓ No edge filtering applied")
+            losses = shared_losses.copy()
+        else:
+            variant_name = f"edge_{edge_threshold}m"
+            print("\n" + "=" * 80)
+            print(f"VARIANT: {edge_threshold}M EDGE FILTER")
+            print("=" * 80)
+            print(f"\n[5/7] Applying {edge_threshold}m edge filter...")
+            gdf_input, loss_edge = apply_edge_filter(gdf_input, min_distance_m=edge_threshold)
+            losses = shared_losses + [loss_edge]
 
-    gdf_no_edge = gdf_with_distances.copy()
-    losses_no_edge = shared_losses.copy()
+        # Genus Viability Check
+        print("\n[6/7] Checking genus viability (≥500 per city)...")
+        viable_genera, viable_stats, all_counts = check_genus_viability(gdf_input)
 
-    # Kein Edge Filtering
-    print("\n[5/7] Skipping edge filter...")
-    print("  ✓ No edge filtering applied")
+        gdf_filtered, loss_genus = filter_viable_genera(gdf_input, viable_genera)
+        losses.append(loss_genus)
 
-    # Genus Viability Check
-    print("\n[6/7] Checking genus viability (≥500 per city)...")
-    viable_genera_no_edge, viable_stats_no_edge, all_counts_no_edge = (
-        check_genus_viability(gdf_no_edge)
-    )
+        # Spatial Grid Assignment
+        print("\n[7/7] Assigning spatial grid (1km cells)...")
+        gdf_filtered = create_spatial_grid(gdf_filtered, cell_size_m=GRID_CELL_SIZE_M)
 
-    gdf_no_edge, loss_genus_no_edge = filter_viable_genera(
-        gdf_no_edge, viable_genera_no_edge
-    )
-    losses_no_edge.append(loss_genus_no_edge)
+        # Export
+        print("\nExporting dataset...")
+        export_filtered_dataset(gdf_filtered, variant_name)
 
-    # Spatial Grid Assignment
-    print("\n[7/7] Assigning spatial grid (1km cells)...")
-    gdf_no_edge = create_spatial_grid(gdf_no_edge, cell_size_m=GRID_CELL_SIZE_M)
+        print("\nExporting metadata...")
+        export_metadata(viable_stats, all_counts, losses, variant_name)
 
-    # Export
-    print("\nExporting dataset...")
-    export_filtered_dataset(gdf_no_edge, "no_edge")
+        return len(gdf_filtered), viable_genera
 
-    print("\nExporting metadata...")
-    export_metadata(viable_stats_no_edge, all_counts_no_edge, losses_no_edge, "no_edge")
+    # Process no-edge variant
+    tree_count, genera = process_variant(gdf_with_distances.copy())
+    results_summary["no_edge"] = {"trees": tree_count, "genera": genera}
 
-    # ========================================================================
-    # VARIANTE B: 15m Edge Filter
-    # ========================================================================
-    print("\n" + "=" * 80)
-    print("VARIANT B: 15M EDGE FILTER")
-    print("=" * 80)
-
-    gdf_edge = gdf_with_distances.copy()
-    losses_edge = shared_losses.copy()
-
-    # Edge Filtering anwenden
-    print("\n[5/7] Applying 15m edge filter...")
-    gdf_edge, loss_edge = apply_edge_filter(
-        gdf_edge, min_distance_m=EDGE_DISTANCE_THRESHOLD_M
-    )
-    losses_edge.append(loss_edge)
-
-    # Genus Viability Check
-    print("\n[6/7] Checking genus viability (≥500 per city)...")
-    viable_genera_edge, viable_stats_edge, all_counts_edge = check_genus_viability(
-        gdf_edge
-    )
-
-    gdf_edge, loss_genus_edge = filter_viable_genera(gdf_edge, viable_genera_edge)
-    losses_edge.append(loss_genus_edge)
-
-    # Spatial Grid Assignment
-    print("\n[7/7] Assigning spatial grid (1km cells)...")
-    gdf_edge = create_spatial_grid(gdf_edge, cell_size_m=GRID_CELL_SIZE_M)
-
-    # Export
-    print("\nExporting dataset...")
-    export_filtered_dataset(gdf_edge, "edge_15m")
-
-    print("\nExporting metadata...")
-    export_metadata(viable_stats_edge, all_counts_edge, losses_edge, "edge_15m")
+    # Process edge filter variants
+    for edge_threshold in EDGE_DISTANCE_THRESHOLDS_M:
+        tree_count, genera = process_variant(gdf_with_distances.copy(), edge_threshold)
+        results_summary[f"edge_{edge_threshold}m"] = {"trees": tree_count, "genera": genera}
 
     # ========================================================================
     # Zusammenfassung
@@ -515,24 +433,26 @@ def main() -> None:
     print("✓ PIPELINE COMPLETE")
     print("=" * 80)
 
-    print("\nVariant A (no_edge):")
-    print(f"  Trees: {len(gdf_no_edge):,}")
-    print(f"  Genera: {len(viable_genera_no_edge)}")
-    if viable_genera_no_edge:
-        print(f"  → {', '.join(sorted(viable_genera_no_edge))}")
+    print("\n📊 Summary of all variants:")
+    print("-" * 60)
+    
+    for variant, data in results_summary.items():
+        print(f"\n{variant}:")
+        print(f"  Trees: {data['trees']:,}")
+        print(f"  Genera: {len(data['genera'])}")
+        if data['genera']:
+            print(f"  → {', '.join(sorted(data['genera']))}")
 
-    print("\nVariant B (edge_15m):")
-    print(f"  Trees: {len(gdf_edge):,}")
-    print(f"  Genera: {len(viable_genera_edge)}")
-    if viable_genera_edge:
-        print(f"  → {', '.join(sorted(viable_genera_edge))}")
-
-    # Vergleich: Gattungen die durch Edge Filter verloren gehen
-    only_in_no_edge = set(viable_genera_no_edge) - set(viable_genera_edge)
-    if only_in_no_edge:
-        print(
-            f"\n⚠️  Genera lost due to edge filtering: {', '.join(sorted(only_in_no_edge))}"
-        )
+    # Vergleich: Gattungen die durch verschiedene Edge Filter verloren gehen
+    print("\n" + "-" * 60)
+    print("📉 Genera lost per edge filter threshold:")
+    
+    base_genera = set(results_summary["no_edge"]["genera"])
+    for edge_threshold in EDGE_DISTANCE_THRESHOLDS_M:
+        variant_name = f"edge_{edge_threshold}m"
+        edge_genera = set(results_summary[variant_name]["genera"])
+        lost = base_genera - edge_genera
+        print(f"\n  {variant_name}: {', '.join(sorted(lost)) if lost else '(none)'}")
 
 
 if __name__ == "__main__":

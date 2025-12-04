@@ -7,11 +7,17 @@ Nutzt openEO (Copernicus Data Space Ecosystem) für cloud-native Verarbeitung:
 - Resampling auf 10m Auflösung
 - Output: 10 Bänder pro Monat (B02-B12, ohne B01/B09/B10)
 
+Post-Processing (lokal):
+- Reprojektion zu EPSG:25832 (ETRS89 / UTM Zone 32N)
+- Clipping auf Stadtgrenzen mit 500m Buffer
+- Speicheroptimierung durch präzises Clipping
+
 Datenquelle: Copernicus Data Space Ecosystem (https://openeo.dataspace.copernicus.eu)
 """
 
 import argparse
-import logging
+import sys
+import tempfile
 from calendar import monthrange
 from pathlib import Path
 
@@ -20,116 +26,64 @@ import numpy as np
 import openeo
 import rasterio
 from rasterio.crs import CRS
+from rasterio.features import geometry_mask
+from rasterio.warp import calculate_default_transform, reproject, Resampling
 
-# Konstanten
-CITIES = ["Hamburg", "Berlin", "Rostock"]
-BOUNDARIES_PATH = Path("data/boundaries/city_boundaries_500m_buffer.gpkg")
-OUTPUT_DIR = Path("data/sentinel2")
-TARGET_CRS = "EPSG:25832"
-TARGET_RESOLUTION = 10  # meters
-
-# Sentinel-2 Bänder für Vegetation
-SPECTRAL_BANDS = [
-    "B02",  # Blue (10m)
-    "B03",  # Green (10m)
-    "B04",  # Red (10m)
-    "B05",  # Red Edge 1 (20m → 10m)
-    "B06",  # Red Edge 2 (20m → 10m)
-    "B07",  # Red Edge 3 (20m → 10m)
-    "B08",  # NIR (10m)
-    "B8A",  # Narrow NIR (20m → 10m)
-    "B11",  # SWIR 1 (20m → 10m)
-    "B12",  # SWIR 2 (20m → 10m)
-]
-
-# SCL-Werte für Cloud-Masking
-# 3=Cloud shadows, 8=Cloud medium, 9=Cloud high, 10=Thin cirrus
-CLOUD_MASK_VALUES = [3, 8, 9, 10]
-
-# openEO Backend
-OPENEO_BACKEND = "openeo.dataspace.copernicus.eu"
-
-# Logging Setup
-logging.basicConfig(
-    level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s"
+sys.path.insert(0, str(Path(__file__).parent.parent))
+from config import (
+    BOUNDARIES_BUFFERED_PATH,
+    CITIES,
+    CLOUD_MASK_VALUES,
+    EXPECTED_BAND_COUNT,
+    OPENEO_BACKEND,
+    SENTINEL2_DIR,
+    SPECTRAL_BANDS,
+    TARGET_CRS,
+    TARGET_RESOLUTION,
+    VEGETATION_INDICES,
 )
-logger = logging.getLogger(__name__)
 
 
 def get_month_range(year: int, month: int) -> tuple[str, str]:
     """
     Gibt Start- und Enddatum für einen Monat zurück.
-
-    Args:
-        year: Jahr
-        month: Monat (1-12)
-
-    Returns:
-        Tuple (start_date, end_date) im Format YYYY-MM-DD
     """
-    _, last_day = monthrange(year, month)
-    start = f"{year}-{month:02d}-01"
-    end = f"{year}-{month:02d}-{last_day:02d}"
-    return start, end
+    last_day = monthrange(year, month)[1]
+    return f"{year}-{month:02d}-01", f"{year}-{month:02d}-{last_day:02d}"
 
 
-def load_city_bounds(city_name: str) -> dict:
+def load_city_bounds(city_name: str) -> tuple[dict, gpd.GeoDataFrame]:
     """
-    Lädt Stadtgrenzen aus GeoPackage und gibt Bounding Box zurück.
-
-    Args:
-        city_name: Name der Stadt (Hamburg, Berlin, Rostock)
-
-    Returns:
-        Dict mit west, south, east, north, crs Schlüsseln
+    Lädt Stadtgrenzen aus GeoPackage und gibt Bounding Box sowie Geometrie zurück.
     """
-    logger.info(f"Loading boundary for {city_name}...")
-    boundaries = gpd.read_file(BOUNDARIES_PATH)
-
-    # Spalte 'gen' enthält Stadtnamen
-    city_gdf = boundaries[boundaries["gen"] == city_name]
-
-    if city_gdf.empty:
-        raise ValueError(f"No boundary found for {city_name}")
-
+    boundaries = gpd.read_file(BOUNDARIES_BUFFERED_PATH)
+    
+    city_data = boundaries[boundaries["gen"] == city_name]
+    
     # Reprojektion zu EPSG:4326 für openEO (erwartet lat/lon)
-    city_gdf_wgs84 = city_gdf.to_crs("EPSG:4326")
-    bounds = city_gdf_wgs84.total_bounds  # [minx, miny, maxx, maxy]
+    city_data_wgs84 = city_data.to_crs("EPSG:4326")
+    bounds = city_data_wgs84.total_bounds  # [minx, miny, maxx, maxy]
 
     bbox = {
-        "west": float(bounds[0]),
-        "south": float(bounds[1]),
-        "east": float(bounds[2]),
-        "north": float(bounds[3]),
+        "west": bounds[0],
+        "south": bounds[1],
+        "east": bounds[2],
+        "north": bounds[3],
         "crs": "EPSG:4326",
     }
 
-    logger.info(f"  Bounds: W={bbox['west']:.4f}, S={bbox['south']:.4f}, "
-                f"E={bbox['east']:.4f}, N={bbox['north']:.4f}")
-
-    return bbox
+    return bbox, city_data
 
 
 def connect_openeo() -> openeo.Connection:
     """
     Stellt Verbindung zu openEO Backend her und authentifiziert.
-
-    Returns:
-        Authentifizierte openEO Connection
-
-    Note:
-        Beim ersten Aufruf öffnet sich ein Browser für die Authentifizierung.
-        Danach wird ein Refresh-Token lokal gespeichert.
     """
+    import re
     import webbrowser
 
-    logger.info(f"Connecting to openEO backend: {OPENEO_BACKEND}")
     connection = openeo.connect(OPENEO_BACKEND)
 
-    logger.info("Authenticating with OIDC...")
-
-    # Define custom display function to ensure URL is printed
-    # The display function receives a single message string from openEO
     def show_device_code(message: str) -> None:
         print("\n" + "=" * 70)
         print("AUTHENTICATION REQUIRED")
@@ -137,24 +91,19 @@ def connect_openeo() -> openeo.Connection:
         print(message)
         print("=" * 70 + "\n")
 
-        # Try to extract URL and open browser automatically
-        import re
-
-        url_match = re.search(r"(https?://[^\s]+)", message)
+        url_match = re.search(r"https?://[^\s]+", message)
         if url_match:
             try:
-                webbrowser.open(url_match.group(1))
+                webbrowser.open(url_match.group(0))
                 print("(Browser should open automatically)")
             except Exception:
                 print("(Please open the URL manually)")
 
-    # Use device code flow with explicit display
     connection.authenticate_oidc_device(
         provider_id="CDSE",
         display=show_device_code,
     )
 
-    logger.info("Successfully authenticated!")
     return connection
 
 
@@ -168,156 +117,157 @@ def process_monthly_composite(
 ) -> None:
     """
     Verarbeitet und lädt ein monatliches Sentinel-2 Komposit herunter.
-
-    Args:
-        connection: Authentifizierte openEO-Verbindung
-        city_name: Name der Stadt
-        bbox: Bounding Box als Dict
-        year: Jahr
-        month: Monat (1-12)
-        output_path: Ausgabepfad für GeoTIFF
-
-    Pipeline:
-        1. Lade S2 L2A Collection
-        2. Cloud-Masking mit SCL-Band
-        3. Resampling auf 10m
-        4. Temporale Median-Aggregation
-        5. Download als GeoTIFF
     """
     start_date, end_date = get_month_range(year, month)
-    logger.info(f"Processing {city_name} {year}-{month:02d} ({start_date} to {end_date})")
-
-    # Lade Sentinel-2 L2A mit allen benötigten Bändern + SCL
-    bands_with_scl = SPECTRAL_BANDS + ["SCL"]
 
     s2_cube = connection.load_collection(
         "SENTINEL2_L2A",
         spatial_extent=bbox,
         temporal_extent=[start_date, end_date],
-        bands=bands_with_scl,
+        bands=SPECTRAL_BANDS + ["SCL"],
     )
 
-    # Cloud-Masking: Erstelle Maske aus SCL-Band
+    # Cloud masking: exclude all problematic SCL values
     scl = s2_cube.band("SCL")
-
-    # Erstelle binäre Maske (True = valid, False = cloud/shadow)
-    mask = scl != 3  # Start with non-shadow
-    for cloud_val in CLOUD_MASK_VALUES[1:]:
-        mask = mask & (scl != cloud_val)
-
-    # Wende Maske auf alle Bänder an
-    s2_masked = s2_cube.mask(~mask)
-
-    # Entferne SCL-Band (nur für Masking benötigt)
-    s2_masked = s2_masked.filter_bands(SPECTRAL_BANDS)
-
-    # Resample 20m Bänder auf 10m
-    s2_resampled = s2_masked.resample_spatial(
-        resolution=TARGET_RESOLUTION,
-        method="bilinear",
+    # Since DataCube doesn't have isin() or logical_not(), use ~ for NOT
+    cloud_mask = (
+        (scl == CLOUD_MASK_VALUES[0]) |
+        (scl == CLOUD_MASK_VALUES[1]) |
+        (scl == CLOUD_MASK_VALUES[2]) |
+        (scl == CLOUD_MASK_VALUES[3])
     )
+    mask = ~cloud_mask
 
-    # Temporale Aggregation: Median über alle gültigen Beobachtungen
-    s2_monthly = s2_resampled.reduce_dimension(
-        dimension="t",
-        reducer="median",
+    s2_monthly = (
+        s2_cube.mask(~mask)
+        .filter_bands(SPECTRAL_BANDS)
+        .resample_spatial(resolution=TARGET_RESOLUTION, method="bilinear")
+        .reduce_dimension(dimension="t", reducer="median")
     )
-
-    # Starte Job und warte auf Abschluss
-    logger.info(f"Starting openEO batch job for {city_name} {year}-{month:02d}...")
 
     job = s2_monthly.execute_batch(
         out_format="GTiff",
         title=f"S2_{city_name}_{year}_{month:02d}",
         outputfile=output_path,
-        job_options={
-            "driver-memory": "4g",
-            "executor-memory": "4g",
-        },
+        job_options={"driver-memory": "4g", "executor-memory": "4g"},
     )
-
-    logger.info(f"Job submitted: {job.job_id}")
-    logger.info("Waiting for job completion (this may take 10-30 minutes)...")
-
-    # Warte auf Job-Abschluss
     job.start_and_wait()
-
-    # Download Ergebnis
-    logger.info(f"Downloading result to {output_path}...")
     job.download_result(output_path)
 
-    logger.info(f"✓ Downloaded: {output_path.name}")
+
+def reproject_and_add_indices(
+    input_path: Path,
+    output_path: Path,
+) -> None:
+    """
+    Reprojiziert Raster zu EPSG:25832 und fügt Vegetationsindizes hinzu.
+    
+    Output-Bänder: 10 Spektralbänder + 5 Indizes
+    - NDre: (B8A - B05) / (B8A + B05)
+    - NDVIre: (B8A - B04) / (B8A + B04)  
+    - kNDVI: tanh((B08 - B04)² / (B08 + B04)²)
+    - VARI: (B03 - B04) / (B03 + B04 - B02)
+    - RTVIcore: 100*(B8A - B05) - 10*(B8A - B04)
+    """
+    with rasterio.open(input_path) as src:
+        dst_crs = CRS.from_string(TARGET_CRS)
+        transform, width, height = calculate_default_transform(
+            src.crs, dst_crs, src.width, src.height, *src.bounds,
+            resolution=TARGET_RESOLUTION,
+        )
+
+        # Reproject all spectral bands
+        bands = {}
+        for i, name in enumerate(SPECTRAL_BANDS, start=1):
+            dst_array = np.zeros((height, width), dtype=np.float32)
+            reproject(
+                source=rasterio.band(src, i),
+                destination=dst_array,
+                src_transform=src.transform,
+                src_crs=src.crs,
+                dst_transform=transform,
+                dst_crs=dst_crs,
+                resampling=Resampling.bilinear,
+            )
+            bands[name] = dst_array
+        
+        # Calculate vegetation indices
+        eps = 1e-8
+        b02, b03, b04 = bands["B02"], bands["B03"], bands["B04"]
+        b05, b08, b8a = bands["B05"], bands["B08"], bands["B8A"]
+        
+        indices = {
+            "NDre": (b8a - b05) / (b8a + b05 + eps),
+            "NDVIre": (b8a - b04) / (b8a + b04 + eps),
+            "kNDVI": np.tanh(((b08 - b04) / (b08 + b04 + eps)) ** 2),
+            "VARI": (b03 - b04) / (b03 + b04 - b02 + eps),
+            "RTVIcore": 100 * (b8a - b05) - 10 * (b8a - b04),
+        }
+        
+        # Write output
+        dst_meta = src.meta.copy()
+        dst_meta.update({
+            "crs": dst_crs,
+            "transform": transform,
+            "width": width,
+            "height": height,
+            "count": len(SPECTRAL_BANDS) + len(VEGETATION_INDICES),
+            "dtype": "float32",
+            "compress": "lzw",
+            "predictor": 2,
+            "tiled": True,
+            "blockxsize": 512,
+            "blockysize": 512,
+        })
+
+        with rasterio.open(output_path, "w", **dst_meta) as dst:
+            for i, name in enumerate(SPECTRAL_BANDS, start=1):
+                dst.write(bands[name], i)
+                dst.set_band_description(i, name)
+            
+            for i, name in enumerate(VEGETATION_INDICES, start=len(SPECTRAL_BANDS) + 1):
+                dst.write(indices[name].astype(np.float32), i)
+                dst.set_band_description(i, name)
 
 
-def validate_output(file_path: Path) -> bool:
+def validate_output(file_path: Path, city_geometry: gpd.GeoDataFrame) -> bool:
     """
     Validiert heruntergeladenes Sentinel-2 GeoTIFF.
-
-    Args:
-        file_path: Pfad zur GeoTIFF-Datei
-
-    Returns:
-        True wenn valide, sonst False
-
-    Checks:
-        - Band count: 10
-        - CRS: EPSG:25832 oder EPSG:4326 (wird später reprojiziert)
-        - Resolution: ~10m
-        - Valid pixels: >50%
-        - Reflectance range: 0-10000
     """
     try:
         with rasterio.open(file_path) as src:
-            # Check 1: Korrekte Bandanzahl
-            if src.count != len(SPECTRAL_BANDS):
-                logger.warning(
-                    f"Expected {len(SPECTRAL_BANDS)} bands, got {src.count}"
-                )
+            if src.count != EXPECTED_BAND_COUNT:
                 return False
 
-            # Check 2: CRS vorhanden
-            if src.crs is None:
-                logger.warning("No CRS defined")
+            if src.crs is None or src.crs != CRS.from_string(TARGET_CRS):
                 return False
 
-            # Check 3: Auflösung prüfen (ungefähr 10m)
-            res_x, res_y = abs(src.res[0]), abs(src.res[1])
-            # Bei WGS84 ist Auflösung in Grad (~0.0001° ≈ 10m)
-            if src.crs == CRS.from_epsg(4326):
-                if not (0.00005 < res_x < 0.0002):
-                    logger.warning(f"Unexpected resolution in degrees: {res_x}")
-                    return False
-            else:
-                if not (5 < res_x < 15):
-                    logger.warning(f"Resolution mismatch: {res_x}m (expected ~10m)")
-                    return False
-
-            # Check 4: Valid pixels Anteil
-            data = src.read(1)  # Erstes Band (Blue)
-            valid_mask = (data > 0) & (data <= 10000)
-            valid_pct = np.sum(valid_mask) / data.size
-
-            if valid_pct < 0.3:
-                logger.warning(
-                    f"Only {valid_pct:.1%} valid pixels (may be cloud-contaminated)"
-                )
+            res_x = abs(src.res[0])
+            if not (5 < res_x < 15):
                 return False
 
-            # Check 5: Reflectance Wertebereich
-            max_val = data[valid_mask].max() if valid_mask.any() else 0
-            if max_val > 10000:
-                logger.warning(f"Reflectance out of range: max={max_val}")
-                return False
-
-            logger.info(
-                f"✓ Validated {file_path.name}: "
-                f"{src.width}x{src.height}, {src.count} bands, "
-                f"CRS: {src.crs}, Valid: {valid_pct:.1%}"
+            data = src.read(1)
+            
+            city_mask = geometry_mask(
+                city_geometry.geometry,
+                out_shape=(src.height, src.width),
+                transform=src.transform,
+                invert=True
             )
+            
+            pixels_in_city = np.sum(city_mask)
+            if pixels_in_city == 0:
+                return False
+            
+            has_data = data != 0
+            pixels_with_data_in_city = np.sum(city_mask & has_data)
+            
+            if pixels_with_data_in_city / pixels_in_city < 0.5:
+                return False
+
             return True
 
-    except Exception as e:
-        logger.error(f"Validation failed for {file_path}: {e}")
+    except Exception:
         return False
 
 
@@ -330,99 +280,73 @@ def download_sentinel2(
 ) -> None:
     """
     Lädt Sentinel-2 Monatskompositionen für alle Städte herunter.
-
-    Args:
-        cities: Liste der Stadtnamen
-        year: Jahr
-        months: Liste der Monate (1-12)
-        output_dir: Ausgabeverzeichnis
-        resume: Überspringe existierende Dateien
     """
-    # Verbinde zu openEO
     connection = connect_openeo()
 
-    # Lade Stadtgrenzen
     city_bounds = {}
+    city_geometries = {}
     for city in cities:
-        city_bounds[city] = load_city_bounds(city)
+        bbox, geometry = load_city_bounds(city)
+        city_bounds[city] = bbox
+        city_geometries[city] = geometry
 
-    # Verarbeite alle Stadt/Monat-Kombinationen
-    total_files = len(cities) * len(months)
     processed = 0
     failed = []
 
     for city in cities:
         city_output_dir = output_dir / city.lower()
         city_output_dir.mkdir(parents=True, exist_ok=True)
+        city_geom = city_geometries[city]
+        city_bbox = city_bounds[city]
 
         for month in months:
             processed += 1
             output_path = city_output_dir / f"S2_{year}_{month:02d}_median.tif"
 
-            # Checkpointing: Überspringe existierende valide Dateien
-            if resume and output_path.exists():
-                if validate_output(output_path):
-                    logger.info(
-                        f"[{processed}/{total_files}] Skipping {output_path.name} "
-                        "(already exists and valid)"
-                    )
-                    continue
-                else:
-                    logger.info(
-                        f"[{processed}/{total_files}] Re-downloading invalid file: "
-                        f"{output_path.name}"
-                    )
+            if resume and output_path.exists() and validate_output(output_path, city_geom):
+                continue
 
-            logger.info(f"[{processed}/{total_files}] Processing {city} {year}-{month:02d}")
-
+            print(f"Processing {city} {month:02d}...")
             try:
-                process_monthly_composite(
-                    connection=connection,
-                    city_name=city,
-                    bbox=city_bounds[city],
-                    year=year,
-                    month=month,
-                    output_path=output_path,
-                )
+                with tempfile.NamedTemporaryFile(suffix=".tif", delete=False) as tmp_file:
+                    tmp_download_path = Path(tmp_file.name)
 
-                # Validiere nach Download
-                if not validate_output(output_path):
-                    logger.warning(f"Validation failed for {output_path.name}")
+                try:
+                    process_monthly_composite(
+                        connection=connection,
+                        city_name=city,
+                        bbox=city_bbox,
+                        year=year,
+                        month=month,
+                        output_path=tmp_download_path,
+                    )
+
+                    reproject_and_add_indices(
+                        input_path=tmp_download_path,
+                        output_path=output_path,
+                    )
+
+                finally:
+                    if tmp_download_path.exists():
+                        tmp_download_path.unlink()
+
+                if not validate_output(output_path, city_geom):
                     failed.append((city, month))
+                    print(f"Warning: {city} {month:02d} has <50% valid pixels")
+                else:
+                    print(f"✓ Completed {city} {month:02d}")
 
             except Exception as e:
-                logger.error(f"Failed to process {city} {year}-{month:02d}: {e}")
                 failed.append((city, month))
-
-    # Summary
-    logger.info("=" * 70)
-    logger.info("Download Summary")
-    logger.info("=" * 70)
-    logger.info(f"Total: {total_files} files")
-    logger.info(f"Successful: {total_files - len(failed)}")
-    logger.info(f"Failed: {len(failed)}")
-
-    if failed:
-        logger.warning("Failed downloads:")
-        for city, month in failed:
-            logger.warning(f"  - {city} {year}-{month:02d}")
+                print(f"✗ Failed {city} {month:02d}: {e}")
 
 
 def parse_month_range(month_str: str) -> list[int]:
-    """
-    Parst Monats-Bereichsangabe.
-
-    Args:
-        month_str: z.B. "1-12", "4-10", "6"
-
-    Returns:
-        Liste von Monaten als Integers
-    """
+    """Parst Monats-Bereichsangabe."""
     if "-" in month_str:
         start, end = month_str.split("-")
         return list(range(int(start), int(end) + 1))
-    else:
-        return [int(month_str)]
+    return [int(month_str)]
 
 
 def main() -> None:
@@ -454,8 +378,8 @@ Examples:
     parser.add_argument(
         "--year",
         type=int,
-        default=2024,
-        help="Year to download (default: 2024)",
+        default=2021,
+        help="Year to download (default: 2021)",
     )
 
     parser.add_argument(
@@ -468,8 +392,8 @@ Examples:
     parser.add_argument(
         "--output",
         type=Path,
-        default=OUTPUT_DIR,
-        help=f"Output directory (default: {OUTPUT_DIR})",
+        default=SENTINEL2_DIR,
+        help=f"Output directory (default: {SENTINEL2_DIR})",
     )
 
     parser.add_argument(
@@ -479,18 +403,7 @@ Examples:
     )
 
     args = parser.parse_args()
-
     months = parse_month_range(args.months)
-
-    logger.info("=" * 70)
-    logger.info("Sentinel-2 Download - openEO")
-    logger.info("=" * 70)
-    logger.info(f"Cities: {', '.join(args.cities)}")
-    logger.info(f"Year: {args.year}")
-    logger.info(f"Months: {min(months)}-{max(months)} ({len(months)} months)")
-    logger.info(f"Output: {args.output}")
-    logger.info(f"Resume: {not args.no_resume}")
-    logger.info("=" * 70)
 
     download_sentinel2(
         cities=args.cities,
@@ -499,6 +412,10 @@ Examples:
         output_dir=args.output,
         resume=not args.no_resume,
     )
+
+    # Optional: Print summary if failed
+    if failed:
+        print(f"\nFailed downloads: {failed}")
 
 
 if __name__ == "__main__":

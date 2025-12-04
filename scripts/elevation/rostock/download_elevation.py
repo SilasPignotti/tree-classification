@@ -10,7 +10,6 @@ Daten sind im XYZ-Format, erfordert GDAL-Konvertierung.
 """
 
 import logging
-import shutil
 import subprocess
 import xml.etree.ElementTree as ET
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -30,7 +29,7 @@ CITY = "Rostock"
 DOM_FEED_URL = "https://www.geodaten-mv.de/dienste/dom_atom"
 DGM_FEED_URL = "https://www.geodaten-mv.de/dienste/dgm_atom"
 BOUNDARIES_PATH = Path("data/boundaries/city_boundaries_500m_buffer.gpkg")
-OUTPUT_DIR = Path("data/raw/rostock")
+OUTPUT_DIR = Path("data/CHM/raw/rostock")
 CRS = "EPSG:25832"  # MV nutzt EPSG:25833, wird zu 25832 konvertiert
 MAX_RETRIES = 3
 MAX_WORKERS = 3  # Parallel processing
@@ -590,7 +589,7 @@ def process_elevation_data(
 def main() -> None:
     """Hauptfunktion: Lädt und verarbeitet Höhendaten für Rostock."""
     logger.info("=" * 70)
-    logger.info(f"Rostock Elevation Data Download - DOM & DGM (XYZ Format)")
+    logger.info("Rostock Elevation Data Download - DOM & DGM (XYZ Format)")
     logger.info("CRITICAL: Spatial filtering to avoid downloading all MV (6407 tiles)!")
     logger.info("=" * 70)
 

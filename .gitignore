@@ -10,9 +10,24 @@ wheels/
 .venv
 
 # Large data files
-data/raw/
-data/processed/*.tif
 data/sentinel2/
+data/CHM/
+data/tree_cadastres/
+data/boundaries/
+
 
 # Task management
 tasks/
+docs/documentation_old/
+docs/Projektdesign.json
+
+# Project-specific files
+CHANGELOG.md
+CLAUDE.md
+
+# Development environment files
+.vscode/
+.nox/
+.claude/
+.ruff_cache/
+noxfile.py

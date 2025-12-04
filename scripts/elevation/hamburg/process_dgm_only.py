@@ -111,7 +111,7 @@ def mosaic_with_gdalwarp(
 
     try:
         logger.info("Running gdalwarp merge (this will take a while)...")
-        result = subprocess.run(
+        subprocess.run(
             warp_cmd,
             check=True,
             capture_output=True,

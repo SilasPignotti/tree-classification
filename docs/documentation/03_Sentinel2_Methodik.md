@@ -1,87 +1,79 @@
-# Datenakquise: Sentinel-2 Multispektraldaten - Methodik und Dokumentation
+# Datenakquise: Sentinel-2 - Methodik und Dokumentation
 
-**Projektphase:** Datenakquise  
-**Datum:** 29. November 2024  
+**Projektphase:** Datenakquise
+**Datum:** 4. Dezember 2025
 **Autor:** Silas Pignotti
 
 ---
 
 ## 1. Übersicht
 
-Dieser Bericht dokumentiert die Methodik zur Beschaffung und Vorverarbeitung von Sentinel-2 L2A Multispektraldaten für drei deutsche Städte: Hamburg, Berlin und Rostock. Diese Daten bilden zusammen mit dem CHM die Grundlage für die spektrale und strukturelle Klassifikation von Baumarten.
+Dieser Bericht dokumentiert die Methodik zur Beschaffung und Verarbeitung von Sentinel-2 Satellitendaten für drei deutsche Städte: Hamburg, Berlin und Rostock. Diese Daten bilden die Grundlage für die spektrale Charakterisierung von Bäumen und deren Umgebung und dienen als Input für maschinelle Lernmodelle zur Baumklassifikation.
 
 ### 1.1 Zieldaten
 
-**Sentinel-2 Level-2A (L2A):**
+**Sentinel-2 Monatskompositionen:**
 
-- Atmosphärisch korrigierte Oberflächenreflektanz (Bottom of Atmosphere, BOA)
-- Auflösung: 10m (native Bänder), 20m Bänder auf 10m resampelt
-- Format: GeoTIFF (Cloud-Optimized)
+- Format: GeoTIFF (Cloud-optimiertes Format)
+- Koordinatensystem: EPSG:25832 (ETRS89 / UTM Zone 32N)
+- Auflösung: 10m × 10m
+- Zeitraum: Monatliche Median-Kompositionen für 2021
+- Bänder: 10 Spektralbänder + 5 Vegetationsindizes
 
-**Monatliche Median-Komposite:**
+**Spektralbänder:**
 
-- Zeitraum: Januar - Dezember 2024 (12 Monate)
-- Aggregation: Median über alle wolkenfreien Beobachtungen pro Monat
-- Begründung: Robuste Statistik gegen Ausreißer, phänologische Variation erfasst
+- B02 (Blue), B03 (Green), B04 (Red) - 10m native
+- B05-B07 (Red Edge 1-3) - 20m → 10m resampled
+- B08 (NIR), B8A (Narrow NIR) - 10m/20m → 10m resampled
+- B11-B12 (SWIR 1-2) - 20m → 10m resampled
 
-### 1.2 Spektrale Bänder
+**Vegetationsindizes:**
 
-| Band | Name       | Wellenlänge (nm) | Native Auflösung | Anwendung               |
-| ---- | ---------- | ---------------- | ---------------- | ----------------------- |
-| B02  | Blue       | 490              | 10m              | Vegetation, Wasser      |
-| B03  | Green      | 560              | 10m              | Vegetation (Grünpeak)   |
-| B04  | Red        | 665              | 10m              | Chlorophyll-Absorption  |
-| B05  | Red Edge 1 | 705              | 20m → 10m        | Vegetationsstress       |
-| B06  | Red Edge 2 | 740              | 20m → 10m        | Blattstruktur           |
-| B07  | Red Edge 3 | 783              | 20m → 10m        | LAI-Schätzung           |
-| B08  | NIR        | 842              | 10m              | Biomasse, Struktur      |
-| B8A  | Narrow NIR | 865              | 20m → 10m        | Wasserdampf, Vegetation |
-| B11  | SWIR 1     | 1610             | 20m → 10m        | Feuchtigkeit, Boden     |
-| B12  | SWIR 2     | 2190             | 20m → 10m        | Lignin, Zellulose       |
+- NDre: (B8A - B05) / (B8A + B05)
+- NDVIre: (B8A - B04) / (B8A + B04)
+- kNDVI: tanh((B08 - B04)² / (B08 + B04)²)
+- VARI: (B03 - B04) / (B03 + B04 - B02)
+- RTVIcore: 100×(B8A - B05) - 10×(B8A - B04)
 
-**Nicht verwendete Bänder:**
+### 1.2 Zielstädte
 
-- B01 (Coastal Aerosol, 60m) - zu grob
-- B09 (Water Vapour, 60m) - atmosphärische Korrektur
-- B10 (Cirrus, 60m) - Cloud Detection
+1. **Hamburg** - Trainingsdaten (gesamte Stadt + 500m Buffer)
+2. **Berlin** - Trainingsdaten (gesamte Stadt + 500m Buffer)
+3. **Rostock** - Testdaten als Proxy für Wismar (gesamte Stadt + 500m Buffer)
 
-### 1.3 Zielstädte
+### 1.3 Pipeline-Übersicht
 
-1. **Hamburg** - Trainingsdaten (maritime Klima)
-2. **Berlin** - Trainingsdaten (kontinentales Klima)
-3. **Rostock** - Testdaten als Proxy für Wismar (Ostseeküste)
+Die Sentinel-2 Pipeline besteht aus drei Hauptschritten:
+
+1. **Cloud-Verarbeitung** - openEO-basierte Datenverarbeitung
+2. **Lokale Verarbeitung** - Reprojektion und Indexberechnung
+3. **Validierung** - Qualitätskontrolle und Coverage-Analyse
 
 ---
 
-## 2. Datenquelle und Plattform
+## 2. Datenquellen
 
-### 2.1 openEO und Copernicus Data Space Ecosystem
+### 2.1 Copernicus Data Space Ecosystem
 
-**Plattform:** openEO (https://openeo.dataspace.copernicus.eu)  
-**Backend:** Copernicus Data Space Ecosystem (CDSE)  
-**Authentifizierung:** OIDC (Device Code Flow)
+**Quelle:** Copernicus Data Space Ecosystem (CDSE)
+**Service:** openEO API
+**Backend:** https://openeo.dataspace.copernicus.eu
+**Datensatz:** SENTINEL2_L2A
 
-**Vorteile von openEO:**
+**Datensatz-Details:**
 
-- **Cloud-native Processing:** Verarbeitung auf dem Server, kein lokaler Download von Rohdaten
-- **Skalierbarkeit:** Automatische Ressourcenverwaltung für große Gebiete
-- **Integrierte Cloud-Maskierung:** SCL-Band direkt verfügbar
-- **Temporale Aggregation:** Server-seitige Median-Berechnung
-- **Europäische Datenhoheit:** CDSE unterliegt europäischen Datenschutzrichtlinien
+- **Aktualität:** Laufend aktualisiert (L2A Produkte)
+- **Auflösung:** 10m (B02-B04, B08), 20m (B05-B07, B8A, B11-B12)
+- **Spektralbänder:** Alle 13 Bänder verfügbar
+- **Zusatzbänder:** SCL (Scene Classification), CLD (Cloud Probability)
+- **Abdeckung:** Global, kostenlos
 
-**Kostenstruktur:**
+**Vorteile dieser Datenquelle:**
 
-- Free Tier: ~100 Processing Units/Monat
-- Pro Monatskompositum: ~2-5 Units
-- Ausreichend für gesamtes Projekt
-
-### 2.2 Sentinel-2 Produkt
-
-**Collection:** `SENTINEL2_L2A`  
-**Prozessierungsgrad:** Level-2A (atmosphärisch korrigiert)  
-**Sensor:** MSI (MultiSpectral Instrument)  
-**Revisit-Zeit:** 5 Tage (2 Satelliten: S2A + S2B)  
-**Orbit:** Sun-synchronous, 786 km Höhe
+- Cloud-native Verarbeitung (kein lokaler Download großer Datenmengen)
+- Automatische atmosphärische Korrektur (L2A)
+- Standardisierte APIs und Prozesse
+- Kostenlos und frei verfügbar
 
 ---
 
@@ -90,242 +82,147 @@ Dieser Bericht dokumentiert die Methodik zur Beschaffung und Vorverarbeitung von
 ### 3.1 Workflow-Überblick
 
 ```
-1. Stadtgrenzen laden (+ 500m Buffer, WGS84)
-2. openEO-Verbindung herstellen (OIDC Auth)
-3. Pro Stadt, pro Monat:
-   a. Sentinel-2 Collection laden (spatial + temporal extent)
-   b. Cloud-Masking mit SCL-Band
-   c. 20m Bänder auf 10m resamplen (bilinear)
-   d. Temporaler Median berechnen
-   e. Batch Job starten und warten
-   f. Ergebnis herunterladen
-   g. Validierung
-4. Checkpointing (Resume bei Unterbrechung)
+1. Stadtgrenzen laden (500m Buffer für Kontext)
+2. Bounding Box berechnen (WGS84 für openEO)
+3. openEO Job erstellen:
+   ├── Sentinel-2 L2A Collection laden
+   ├── Räumliche und zeitliche Filterung
+   ├── Cloud-Masking mit SCL-Band
+   ├── Band-Auswahl und Resampling (20m → 10m)
+   ├── Temporale Median-Aggregation
+4. Batch-Job ausführen (asynchron)
+5. Lokale Nachverarbeitung:
+   ├── Reprojektion zu EPSG:25832
+   ├── Vegetationsindizes berechnen
+   ├── GeoTIFF speichern (LZW-Kompression)
+6. Validierung und Coverage-Report
 ```
 
-### 3.2 Räumliche Ausdehnung
+### 3.2 Cloud-Verarbeitung (openEO)
 
-**Quelle:** `data/boundaries/city_boundaries_500m_buffer.gpkg`
-
-**Transformation:**
-
-- Quell-CRS: EPSG:25832 (UTM 32N)
-- openEO erwartet: EPSG:4326 (WGS84 lat/lon)
-- Reprojektion mit GeoPandas vor API-Aufruf
-
-**Bounding Boxes (WGS84):**
-| Stadt | West | South | East | North |
-|-------|------|-------|------|-------|
-| Hamburg | 9.7268° | 53.3906° | 10.3335° | 53.7430° |
-| Berlin | 13.0810° | 52.3338° | 13.7678° | 52.6799° |
-| Rostock | 11.9908° | 54.0461° | 12.3013° | 54.2492° |
-
-### 3.3 Temporale Ausdehnung
-
-**Jahr:** 2024  
-**Monate:** Januar - Dezember (12 Monate)
-
-**Begründung für 12 Monate:**
-
-- Projektdesign spezifiziert April-Oktober (7 Monate) als primär
-- Download aller 12 Monate für Flexibilität bei Ablationsstudien (Exp 4)
-- Marginale Zusatzkosten (~40% mehr Daten)
-- Ermöglicht Test der temporalen Suffizienzhypothese
-
-**Monatsbereich-Berechnung:**
+**Datenauswahl:**
 
 ```python
-from calendar import monthrange
-_, last_day = monthrange(2024, month)
-start = f"2024-{month:02d}-01"
-end = f"2024-{month:02d}-{last_day:02d}"
+s2_cube = connection.load_collection(
+    "SENTINEL2_L2A",
+    spatial_extent=bbox,  # WGS84 Bounding Box
+    temporal_extent=[start_date, end_date],  # Monatsbereich
+    bands=SPECTRAL_BANDS + ["SCL"]
+)
 ```
 
-### 3.4 Cloud-Masking
-
-**Methode:** Scene Classification Layer (SCL)
-
-**Maskierte Klassen:**
-| SCL-Wert | Klasse | Beschreibung |
-|----------|--------|--------------|
-| 3 | Cloud Shadows | Wolkenschatten |
-| 8 | Cloud Medium Probability | Mittlere Wolkenwahrscheinlichkeit |
-| 9 | Cloud High Probability | Hohe Wolkenwahrscheinlichkeit |
-| 10 | Thin Cirrus | Dünne Zirruswolken |
-
-**openEO-Implementierung:**
+**Cloud-Masking:**
 
 ```python
+# SCL-Werte: 3=Cloud shadows, 8=Cloud medium, 9=Cloud high, 10=Thin cirrus
 scl = s2_cube.band("SCL")
-mask = (scl != 3) & (scl != 8) & (scl != 9) & (scl != 10)
+mask = scl.isin([3, 8, 9, 10]).logical_not()
 s2_masked = s2_cube.mask(~mask)
 ```
 
-**Erwartete Beobachtungen:**
-
-- Sentinel-2 Revisit: 2-3 Überflüge pro 5 Tage
-- Pro Monat: 8-12 Szenen
-- Nach Cloud-Masking: ≥5 valide Beobachtungen (typisch)
-
-### 3.5 Resampling
-
-**Ziel:** Einheitliche 10m Auflösung für alle Bänder
-
-**Betroffene Bänder:**
-
-- B05, B06, B07 (Red Edge): 20m → 10m
-- B8A (Narrow NIR): 20m → 10m
-- B11, B12 (SWIR): 20m → 10m
-
-**Methode:** Bilinear Interpolation
-
-- Standard für kontinuierliche Reflektanzdaten
-- Glättet Treppeneffekte
-- Erhält radiometrische Integrität
-
-**openEO-Implementierung:**
+**Temporale Aggregation:**
 
 ```python
-s2_resampled = s2_masked.resample_spatial(
-    resolution=10,
-    method="bilinear"
+s2_monthly = (
+    s2_masked
+    .filter_bands(SPECTRAL_BANDS)
+    .resample_spatial(resolution=10, method="bilinear")
+    .reduce_dimension(dimension="t", reducer="median")
 )
 ```
 
-### 3.6 Temporale Aggregation
-
-**Methode:** Median
-
-**Vorteile:**
-
-- Robust gegen Ausreißer (verbleibende Wolken, Schatten)
-- Standard für optische Zeitreihen-Komposites
-- Erhält spektrale Charakteristik besser als Mittelwert
-
-**openEO-Implementierung:**
-
-```python
-s2_monthly = s2_resampled.reduce_dimension(
-    dimension="t",
-    reducer="median"
-)
-```
-
-### 3.7 Batch Processing
-
-**Job-Konfiguration:**
+**Batch-Ausführung:**
 
 ```python
 job = s2_monthly.execute_batch(
     out_format="GTiff",
-    title=f"S2_{city}_{year}_{month:02d}",
-    job_options={
-        "driver-memory": "4g",
-        "executor-memory": "4g",
-    }
+    title=f"S2_{city_name}_{year}_{month:02d}",
+    outputfile=output_path,
+    job_options={"driver-memory": "4g", "executor-memory": "4g"}
 )
 ```
 
-**Workflow:**
+### 3.3 Lokale Nachverarbeitung
 
-1. Job wird auf CDSE-Server erstellt
-2. Status-Polling alle 10-30 Sekunden
-3. Typische Laufzeit: 3-10 Minuten pro Monat
-4. Download nach Abschluss (HTTP GET)
+**Reprojektion:**
+
+```python
+dst_crs = CRS.from_string("EPSG:25832")
+transform, width, height = calculate_default_transform(
+    src.crs, dst_crs, src.width, src.height, *src.bounds, resolution=10
+)
+```
+
+**Vegetationsindizes-Berechnung:**
+
+```python
+indices = {
+    "NDre": (b8a - b05) / (b8a + b05 + eps),
+    "NDVIre": (b8a - b04) / (b8a + b04 + eps),
+    "kNDVI": np.tanh(((b08 - b04) / (b08 + b04 + eps)) ** 2),
+    "VARI": (b03 - b04) / (b03 + b04 - b02 + eps),
+    "RTVIcore": 100 * (b8a - b05) - 10 * (b8a - b04),
+}
+```
+
+**GeoTIFF-Optimierung:**
+
+```python
+dst_meta.update({
+    "crs": dst_crs,
+    "transform": transform,
+    "count": 15,  # 10 Spektral + 5 Indizes
+    "dtype": "float32",
+    "compress": "lzw",
+    "predictor": 2,
+    "tiled": True,
+    "blockxsize": 512,
+    "blockysize": 512,
+})
+```
+
+### 3.4 Validierung
+
+**Coverage-Berechnung:**
+
+```python
+city_mask = geometry_mask(
+    city_geometry.geometry,
+    out_shape=(src.height, src.width),
+    transform=src.transform,
+    invert=True
+)
+pixels_with_data_in_city = np.sum(valid_mask & city_mask)
+coverage_percent = 100 * pixels_with_data_in_city / pixels_in_city
+```
 
 ---
 
-## 4. Implementierung
+## 4. Herausforderungen und Lösungen
 
-### 4.1 Script-Struktur
+### 4.1 Cloud-Verarbeitung
 
-**Script:** `scripts/sentinel2/download_sentinel2.py`
+**Problem:** Komplexe openEO-API und asynchrone Job-Verarbeitung.
 
-**Hauptkomponenten:**
+**Lösung:** Robuste Fehlerbehandlung und Job-Monitoring mit automatischen Retries.
 
-```python
-# Konstanten
-CITIES = ["Hamburg", "Berlin", "Rostock"]
-SPECTRAL_BANDS = ["B02", "B03", ..., "B12"]
-CLOUD_MASK_VALUES = [3, 8, 9, 10]
-OPENEO_BACKEND = "openeo.dataspace.copernicus.eu"
+### 4.2 Speicheroptimierung
 
-# Funktionen
-def connect_openeo() -> openeo.Connection
-def load_city_bounds(city_name: str) -> dict
-def process_monthly_composite(...) -> None
-def validate_output(file_path: Path) -> bool
-def download_sentinel2(...) -> None
-```
+**Problem:** Große Raster-Dateien (100-160 MB pro Monat/Stadt).
 
-### 4.2 CLI Interface
+**Lösung:** LZW-Kompression, Tiling (512×512), Predictor 2 für Float32-Daten.
 
-```bash
-python scripts/sentinel2/download_sentinel2.py \
-    --cities Hamburg Berlin Rostock \
-    --year 2024 \
-    --months 1-12 \
-    --output data/sentinel2 \
-    [--no-resume]
-```
+### 4.3 CRS-Konsistenz
 
-**Parameter:**
-| Argument | Default | Beschreibung |
-|----------|---------|--------------|
-| `--cities` | Alle 3 | Space-separated Stadtliste |
-| `--year` | 2024 | Ziel-Jahr |
-| `--months` | 1-12 | Monatsbereich (z.B. "4-10") |
-| `--output` | data/sentinel2 | Ausgabeverzeichnis |
-| `--no-resume` | False | Existierende Dateien überschreiben |
+**Problem:** openEO verwendet WGS84, Zielsystem ist UTM.
 
-### 4.3 Authentifizierung
+**Lösung:** Automatische Reprojektion mit bilinearer Interpolation.
 
-**Methode:** OIDC Device Code Flow
+### 4.4 Cloud-Masking
 
-**Ablauf:**
+**Problem:** Balance zwischen zu aggressivem und zu permissivem Cloud-Masking.
 
-1. Script generiert Device Code
-2. URL und Code werden im Terminal angezeigt
-3. Nutzer öffnet URL im Browser
-4. Nutzer meldet sich mit CDSE-Account an
-5. Script erhält Access Token
-6. Refresh Token wird lokal gespeichert (~/.config/openeo-python-client/)
-
-**Implementierung:**
-
-```python
-def show_device_code(message: str) -> None:
-    """Zeigt Device Code URL und Code an."""
-    print("\n" + "=" * 60)
-    print("AUTHENTICATION REQUIRED")
-    print("=" * 60)
-    print(message)
-    print("=" * 60 + "\n")
-
-connection.authenticate_oidc_device(
-    provider_id="CDSE",
-    display=show_device_code
-)
-```
-
-### 4.4 Checkpointing
-
-**Strategie:** Überspringe valide existierende Dateien
-
-```python
-if resume and output_path.exists():
-    if validate_output(output_path):
-        logger.info(f"Skipping {output_path.name} (already exists and valid)")
-        continue
-    else:
-        logger.info(f"Re-downloading invalid file: {output_path.name}")
-```
-
-**Vorteile:**
-
-- Robustheit gegen Netzwerkunterbrechungen
-- Ermöglicht schrittweise Verarbeitung
-- Keine doppelte Arbeit bei Neustart
+**Lösung:** SCL-basierte Maskierung der problematischsten Klassen (Shadows, Medium/High Clouds, Cirrus).
 
 ---
 
@@ -333,75 +230,44 @@ if resume and output_path.exists():
 
 ### 5.1 Validierungskriterien
 
-**Checkliste pro Datei:**
+**Download-Validierung:**
 
-- [ ] 10 spektrale Bänder vorhanden
-- [ ] CRS definiert (EPSG:32632 oder EPSG:4326)
-- [ ] Auflösung ~10m (oder ~0.0001° bei WGS84)
-- [ ] Valide Pixel > 30%
-- [ ] Reflektanzwerte im Bereich 0-10000
+- [ ] 15 Bänder (10 Spektral + 5 Indizes)
+- [ ] EPSG:25832 Koordinatensystem
+- [ ] 10m × 10m Auflösung
+- [ ] Float32 Datentyp
+- [ ] Keine NoData-Werte außerhalb Stadtgebiet
 
-### 5.2 Validierungsfunktion
+**Coverage-Validierung:**
 
-```python
-def validate_output(file_path: Path) -> bool:
-    with rasterio.open(file_path) as src:
-        # Check 1: Bandanzahl
-        assert src.count == 10
+- [ ] Mindestens 50% Coverage innerhalb Stadtgrenzen
+- [ ] Realistische Wertebereiche pro Band
+- [ ] Keine systematischen Artefakte
 
-        # Check 2: CRS vorhanden
-        assert src.crs is not None
+### 5.2 Validierungsergebnisse
 
-        # Check 3: Auflösung
-        # Bei UTM: 5-15m, bei WGS84: 0.00005-0.0002°
+**Coverage-Statistiken (2021):**
 
-        # Check 4: Valid Pixel Anteil
-        data = src.read(1)
-        valid_mask = (data > 0) & (data <= 10000)
-        valid_pct = np.sum(valid_mask) / data.size
-        assert valid_pct > 0.30
+| Stadt   | Durchschnitt Coverage | Min Coverage | Max Coverage | Bemerkung                             |
+| ------- | --------------------- | ------------ | ------------ | ------------------------------------- |
+| Berlin  | 98.1%                 | 89.7% (01)   | 100%         | Durchgehend exzellent                 |
+| Hamburg | 84.6%                 | 44.7% (11)   | 100%         | November kritisch, aber meistens gut  |
+| Rostock | 91.2%                 | 5.9% (01)    | 100%         | Januar problematisch (nördl., Winter) |
 
-        # Check 5: Wertebereich
-        max_val = data[valid_mask].max()
-        assert max_val <= 10000
-```
+**Dateigrößen (tatsächlich):**
 
-### 5.3 Validierungsergebnis (Testlauf)
+- Berlin: 1.76-1.94 GB pro Monat (durchschnittlich 1.91 GB)
+- Hamburg: 0.52-1.09 GB pro Monat (durchschnittlich 0.89 GB)
+- Rostock: 0.068-0.305 GB pro Monat (durchschnittlich 0.29 GB)
 
-**Hamburg Januar 2024:**
+**Band-Statistiken (Beispiel Berlin Januar 2021):**
 
-```
-Dimensions: 4075 × 3979 pixels
-Bands: 10
-CRS: EPSG:32632
-Resolution: 10.0 × 10.0 m
-Data type: int16
-
-Band Statistics:
-B02 (Blue)      | Min:    55 | Max: 16775 | Mean:  3333.4
-B03 (Green)     | Min:    28 | Max: 16232 | Mean:  3057.9
-B04 (Red)       | Min:     5 | Max: 15840 | Mean:  3071.2
-B05 (RE1)       | Min:     3 | Max: 15498 | Mean:  3354.1
-B06 (RE2)       | Min:     1 | Max: 15457 | Mean:  3543.1
-B07 (RE3)       | Min:     4 | Max: 15419 | Mean:  3575.2
-B08 (NIR)       | Min:    25 | Max: 15496 | Mean:  3752.2
-B8A (Narrow NIR)| Min:     1 | Max: 15349 | Mean:  3609.3
-B11 (SWIR1)     | Min:     1 | Max: 15113 | Mean:   897.9
-B12 (SWIR2)     | Min:     1 | Max: 15061 | Mean:   759.9
-
-Valid pixels: 100.0%
-```
-
-**Interpretation:**
-
-- ✅ Alle 10 Bänder vorhanden
-- ✅ CRS korrekt (UTM 32N)
-- ✅ 10m Auflösung
-- ✅ 100% valide Pixel (Winter, wenig Wolken)
-- ✅ Reflektanzwerte plausibel:
-  - Blue/Green/Red ~3000 (Winter-Reflektanz)
-  - NIR ~3700 (höher, typisch)
-  - SWIR ~800-900 (niedriger, typisch für Winter)
+| Band   | Min     | Max     | Mean      | Bemerkung        |
+| ------ | ------- | ------- | --------- | ---------------- |
+| B02    | -594.23 | 19400.0 | 478.57    | Blue             |
+| B04    | -594.23 | 19400.0 | 478.57    | Red              |
+| B08    | -594.23 | 19400.0 | 478.57    | NIR              |
+| NDVIre | -1.0    | 1.0     | 0.24-0.27 | Vegetation Index |
 
 ---
 
@@ -409,343 +275,99 @@ Valid pixels: 100.0%
 
 ### 6.1 Finale Datenprodukte
 
-**Struktur:**
+**Dateistruktur:**
 
 ```
 data/sentinel2/
-├── hamburg/
-│   ├── S2_2024_01_median.tif
-│   ├── S2_2024_02_median.tif
-│   ├── ...
-│   └── S2_2024_12_median.tif
 ├── berlin/
-│   ├── S2_2024_01_median.tif
-│   └── ...
-└── rostock/
-    ├── S2_2024_01_median.tif
-    └── ...
+│   ├── S2_2021_01_median.tif ... S2_2021_12_median.tif (12 Dateien, ✓ 100% vollständig)
+├── hamburg/
+│   ├── S2_2021_01_median.tif ... S2_2021_12_median.tif (12 Dateien, ✓ 100% vollständig)
+├── rostock/
+│   ├── S2_2021_01_median.tif ... S2_2021_12_median.tif (12 Dateien, ✓ 100% vollständig)
+└── coverage_report.csv (Validierungsbericht mit allen Metriken)
 ```
 
-**Pro Datei:**
+**GeoTIFF-Spezifikation:**
 
-- 10 Bänder (B02-B12, ohne B01/B09/B10)
-- ~50-200 MB (abhängig von Stadtgröße)
-- GeoTIFF mit LZW-Kompression
+| Eigenschaft | Wert                         |
+| ----------- | ---------------------------- |
+| Format      | GeoTIFF                      |
+| Bänder      | 15 (10 Spektral + 5 Indizes) |
+| Datentyp    | Float32                      |
+| NoData      | -32768.0 (Standard float32)  |
+| Kompression | LZW                          |
+| CRS         | EPSG:25832                   |
+| Auflösung   | 10m × 10m                    |
 
-**Gesamt:**
+### 6.2 Scripts
 
-- 36 Dateien (3 Städte × 12 Monate)
-- ~2-7 GB Gesamtvolumen
+**Hauptscripts:**
 
-### 6.2 Dateinamen-Konvention
+- `scripts/sentinel2/download_sentinel2.py` - Download und Verarbeitung
+- `scripts/sentinel2/validate_coverage.py` - Coverage-Analyse
 
-```
-S2_{YYYY}_{MM}_median.tif
-```
-
-| Komponente | Bedeutung                  |
-| ---------- | -------------------------- |
-| S2         | Sentinel-2                 |
-| YYYY       | Jahr (2024)                |
-| MM         | Monat (01-12, zero-padded) |
-| median     | Aggregationsmethode        |
-
-### 6.3 Band-Reihenfolge
-
-| Index | Band | Wellenlänge         |
-| ----- | ---- | ------------------- |
-| 1     | B02  | 490 nm (Blue)       |
-| 2     | B03  | 560 nm (Green)      |
-| 3     | B04  | 665 nm (Red)        |
-| 4     | B05  | 705 nm (Red Edge 1) |
-| 5     | B06  | 740 nm (Red Edge 2) |
-| 6     | B07  | 783 nm (Red Edge 3) |
-| 7     | B08  | 842 nm (NIR)        |
-| 8     | B8A  | 865 nm (Narrow NIR) |
-| 9     | B11  | 1610 nm (SWIR 1)    |
-| 10    | B12  | 2190 nm (SWIR 2)    |
+**Konfiguration:** `scripts/config.py`
 
 ---
 
-## 7. Herausforderungen und Lösungen
+## 7. Technische Details
 
-### 7.1 Authentifizierung: Browser öffnet nicht
-
-**Problem:**
-OIDC Device Code Flow zeigt keine URL im Terminal an.
-
-**Ursache:**
-openEO-Bibliothek gibt URL über internen Logger aus, der nicht sichtbar ist.
-
-**Lösung:**
-Custom Display-Funktion für explizite URL-Ausgabe:
-
-```python
-def show_device_code(message: str) -> None:
-    print("\n" + "=" * 60)
-    print("AUTHENTICATION REQUIRED")
-    print(message)
-    print("=" * 60 + "\n")
-
-connection.authenticate_oidc_device(display=show_device_code)
-```
-
-### 7.2 CRS-Diskrepanz
-
-**Beobachtung:**
-Output ist EPSG:32632 (WGS84 / UTM 32N), nicht EPSG:25832 (ETRS89 / UTM 32N).
-
-**Erklärung:**
-
-- openEO/CDSE nutzt WGS84-basiertes UTM
-- EPSG:32632 und EPSG:25832 sind für Deutschland quasi identisch
-- Differenz: ~0.5m (vernachlässigbar bei 10m Auflösung)
-
-**Entscheidung:**
-
-- Akzeptieren, keine Reprojektion erforderlich
-- Bei Bedarf: Reprojektion zu EPSG:25832 mit `gdalwarp`
-
-### 7.3 TIFF-Warnungen
-
-**Warnung:**
-
-```
-TIFFReadDirectory: Sum of Photometric type-related color channels
-and ExtraSamples doesn't match SamplesPerPixel.
-```
-
-**Erklärung:**
-
-- Metadaten-Warnung von GDAL/libtiff
-- openEO schreibt TIFF mit 10 Bändern ohne korrekte Photometric-Tags
-- Daten selbst sind korrekt
-
-**Lösung:**
-
-- Warnung ignorieren (harmlos)
-- Optional: GDAL-Warnungen unterdrücken
-
-### 7.4 Lange Verarbeitungszeiten
-
-**Beobachtung:**
-~3-10 Minuten pro Monat, 2.5-3 Stunden für alle 36 Dateien.
-
-**Faktoren:**
-
-- Server-Last auf CDSE
-- Stadtgröße (Berlin > Hamburg > Rostock)
-- Monat (Sommer: mehr Wolken, mehr Daten)
-
-**Empfehlung:**
-
-- Overnight-Run für vollständigen Download
-- Checkpointing ermöglicht Unterbrechung
-
----
-
-## 8. Technische Details
-
-### 8.1 Verwendete Bibliotheken
+### 7.1 Verwendete Bibliotheken
 
 **Python-Packages:**
 
-```toml
-openeo>=0.46.0      # openEO Python Client
-geopandas>=1.1.1    # Vektor-Geodaten (Boundaries)
-rasterio>=1.4.3     # Raster-Geodaten (Validierung)
-numpy>=1.24.0       # Numerische Arrays
-```
+- `openeo>=0.29.0` - openEO Client für Copernicus Data Space
+- `geopandas>=1.0.1` - Geodaten-Verarbeitung
+- `rasterio>=1.3.0` - Raster-Verarbeitung
+- `numpy>=1.24.0` - Numerische Berechnungen
 
-### 8.2 openEO API-Aufrufe
+**openEO-Prozesse:**
 
-**Wichtige Endpunkte:**
-
-- `load_collection()` - Daten laden
-- `band()` - Einzelnes Band extrahieren
-- `mask()` - Pixelmaske anwenden
-- `filter_bands()` - Bänder filtern
-- `resample_spatial()` - Auflösung ändern
-- `reduce_dimension()` - Temporale Aggregation
-- `execute_batch()` - Batch Job starten
-
-### 8.3 Datenfluss
-
-```
-┌─────────────────────────────────────────────────────────────┐
-│                    CDSE Server                               │
-│                                                              │
-│  ┌───────────┐    ┌───────────┐    ┌───────────┐            │
-│  │ Sentinel-2│───▶│   Cloud   │───▶│ Resample  │            │
-│  │ L2A Data  │    │  Masking  │    │  10m      │            │
-│  └───────────┘    └───────────┘    └───────────┘            │
-│                          │                 │                 │
-│                          ▼                 ▼                 │
-│                   ┌───────────┐    ┌───────────┐            │
-│                   │  Temporal │───▶│  GeoTIFF  │            │
-│                   │   Median  │    │  Output   │            │
-│                   └───────────┘    └───────────┘            │
-│                                           │                  │
-└───────────────────────────────────────────│──────────────────┘
-                                            │
-                                            ▼ HTTP Download
-┌─────────────────────────────────────────────────────────────┐
-│                    Local Machine                             │
-│                                                              │
-│  ┌───────────┐    ┌───────────┐    ┌───────────┐            │
-│  │  Download │───▶│ Validate  │───▶│   Save    │            │
-│  │  Result   │    │   Data    │    │  to Disk  │            │
-│  └───────────┘    └───────────┘    └───────────┘            │
-│                                                              │
-└─────────────────────────────────────────────────────────────┘
-```
+- `load_collection` - Datensatz laden
+- `mask` - Cloud-Masking
+- `resample_spatial` - Auflösung angleichen
+- `reduce_dimension` - Temporale Aggregation
+- `execute_batch` - Asynchrone Verarbeitung
 
 ---
 
-## 9. Performance und Ressourcen
+## 8. Referenzen
 
-### 9.1 Laufzeiten
+### 8.1 Datenquellen
 
-| Phase             | Dauer                  |
-| ----------------- | ---------------------- |
-| Authentifizierung | 1-2 Minuten (einmalig) |
-| Pro Monat/Stadt   | 3-10 Minuten           |
-| Alle 36 Dateien   | 2.5-3 Stunden          |
-
-### 9.2 Datenvolumen
-
-| Stadt      | Erwartete Größe | Pixel-Dimensionen |
-| ---------- | --------------- | ----------------- |
-| Hamburg    | ~1.5 GB         | ~4000 × 4000      |
-| Berlin     | ~2.5 GB         | ~6000 × 4000      |
-| Rostock    | ~1.0 GB         | ~3000 × 2500      |
-| **Gesamt** | **~5 GB**       |                   |
-
-### 9.3 Netzwerk-Anforderungen
-
-- Stabile Internetverbindung für 2-3 Stunden
-- Download-Volumen: ~5 GB
-- Upload: Minimal (nur API-Requests)
+- **Copernicus Data Space:** https://dataspace.copernicus.eu/
+- **openEO:** https://openeo.org/
+- **Sentinel-2 L2A:** https://sentinel.esa.int/web/sentinel/missions/sentinel-2
 
 ---
 
-## 10. Lessons Learned
+## 9. Anhang
 
-### 10.1 Technische Erkenntnisse
+### 9.1 Beispiel-Output (Berlin Januar 2021)
 
-1. **openEO ist produktionsreif:**
+**Datei:** `data/sentinel2/berlin/S2_2021_01_median.tif`  
+**Größe:** 1.76 GB  
+**Coverage:** 89.7% (Januar 2021 war wolkenreich, ab März >99%)  
+**Qualität:** ✓ 15 Bänder, 5063×4337 Pixel, EPSG:25832, Float32
 
-   - Stabile API, gute Dokumentation
-   - Free Tier ausreichend für Forschungsprojekte
-   - Batch Processing zuverlässig
+**Band-Beschreibungen:**
 
-2. **Cloud-Masking ist essentiell:**
-
-   - SCL-basierte Maskierung effektiv
-   - Median-Aggregation kompensiert verbleibende Artefakte
-
-3. **Authentifizierung erfordert Aufmerksamkeit:**
-   - Device Code Flow nicht immer intuitiv
-   - Explizite URL-Ausgabe verbessert UX
-
-### 10.2 Methodische Erkenntnisse
-
-1. **12 Monate sind sinnvoll:**
-
-   - Flexibilität für Ablationsstudien
-   - Geringe Mehrkosten
-
-2. **Bilineare Interpolation angemessen:**
-
-   - Keine Artefakte bei 20m → 10m
-   - Standard in der Fernerkundung
-
-3. **Median robust:**
-   - Weniger sensitiv gegenüber Ausreißern
-   - Gut für operationelle Anwendung
-
----
-
-## 11. Nächste Schritte
-
-### 11.1 Sofortige nächste Schritte
-
-1. ✅ **Vollständiger Download:** Alle 36 Dateien (Overnight-Run)
-2. **Vegetation Indices:** NDVI, kNDVI, EVI berechnen
-3. **Grid Alignment:** CHM (1m) auf S2-Grid (10m) aggregieren
-
-### 11.2 Feature Engineering
-
-**Geplante Indices:**
-
-- NDVI = (B08 - B04) / (B08 + B04)
-- kNDVI = tanh(NDVI²)
-- EVI = 2.5 × (B08 - B04) / (B08 + 6×B04 - 7.5×B02 + 1)
-- NDRE = (B08 - B05) / (B08 + B05)
-- NDWI = (B08 - B11) / (B08 + B11)
-
-### 11.3 Integration mit anderen Datenquellen
-
-1. **CHM-Alignment:** Resampling CHM 1m → 10m (Mean/Max/Std)
-2. **Baumkataster:** Spatial Join mit S2-Pixeln
-3. **Feature Stack:** CHM + S2 + Indices pro Pixel
-
----
-
-## 12. Referenzen
-
-### 12.1 Datenquellen
-
-- **Copernicus Data Space Ecosystem:** https://dataspace.copernicus.eu/
-- **openEO Platform:** https://openeo.cloud/
-- **Sentinel-2 User Handbook:** https://sentinels.copernicus.eu/web/sentinel/user-guides/sentinel-2-msi
-
-### 12.2 Technische Dokumentation
-
-- **openEO Python Client:** https://open-eo.github.io/openeo-python-client/
-- **openEO API:** https://api.openeo.org/
-- **Rasterio Documentation:** https://rasterio.readthedocs.io/
-
-### 12.3 Methodische Referenzen
-
-- **Sen2Cor (L2A Processing):** https://step.esa.int/main/snap-supported-plugins/sen2cor/
-- **SCL Classification:** ESA Sentinel-2 Algorithm Theoretical Basis Document
-
----
-
-## Anhang: Reproduzierbarkeit
-
-### A.1 Vollständiger Workflow
-
-```bash
-# 1. Environment Setup
-uv venv
-uv sync
-
-# 2. Account erstellen (einmalig)
-# https://identity.dataspace.copernicus.eu/
-
-# 3. Sentinel-2 Download
-# Test mit einem Monat
-uv run python scripts/sentinel2/download_sentinel2.py \
-    --cities Hamburg --months 1
-
-# Vollständiger Download (overnight)
-uv run python scripts/sentinel2/download_sentinel2.py
-```
-
-### A.2 Laufzeiten (Approximate)
-
-- **Setup + Auth:** ~5 Minuten
-- **Test (1 Monat):** ~5 Minuten
-- **Vollständig (36 Monate):** ~2.5-3 Stunden
-
-### A.3 System Requirements
-
-- **Disk Space:** Mindestens 10 GB frei
-- **RAM:** 4 GB ausreichend (Processing auf Server)
-- **Netzwerk:** Stabile Verbindung, ~5 GB Download
-- **Software:** Python 3.12+, CDSE Account
+1. B02 - Blue (490nm)
+2. B03 - Green (560nm)
+3. B04 - Red (665nm)
+4. B05 - Red Edge 1 (705nm)
+5. B06 - Red Edge 2 (740nm)
+6. B07 - Red Edge 3 (783nm)
+7. B08 - NIR (842nm)
+8. B8A - Narrow NIR (865nm)
+9. B11 - SWIR 1 (1610nm)
+10. B12 - SWIR 2 (2190nm)
+11. NDre - Normalized Difference Red Edge
+12. NDVIre - Red Edge NDVI
+13. kNDVI - Kernel NDVI
+14. VARI - Visible Atmospherically Resistant Index
+15. RTVIcore - Red Edge Triangle Vegetation Index
 
 ---
 

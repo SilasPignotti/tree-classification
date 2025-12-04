@@ -1,120 +1,99 @@
 """
 Harmonisiert die Baumkataster-Daten von Berlin, Hamburg und Rostock
-in ein einheitliches Schema mit EPSG:25832 und normalisierten Gattungsnamen.
+in ein einheitliches Schema mit EPSG:25832 und normalisierten Gattungs-/Artnamen.
+
+Normalisierung:
+- genus_latin: UPPERCASE (z.B. "QUERCUS")
+- species_latin: lowercase, ohne Gattungspräfix (z.B. "robur" statt "Quercus robur")
 """
 
+import sys
 from pathlib import Path
 
 import geopandas as gpd
 import numpy as np
 import pandas as pd
 
-
-# Konstanten
-BASE_DIR = Path("data/tree_cadastres")
-RAW_DIR = BASE_DIR / "raw"
-PROCESSED_DIR = BASE_DIR / "processed"
-METADATA_DIR = BASE_DIR / "metadata"
-
-TARGET_CRS = "EPSG:25832"
-
-# Zielschema
-TARGET_COLUMNS = [
-    "tree_id",
-    "city",
-    "genus_latin",
-    "species_latin",
-    "plant_year",
-    "height_m",
-    "crown_diameter_m",
-    "stem_circumference_cm",
-    "source_layer",
-    "geometry",
-]
+sys.path.insert(0, str(Path(__file__).parent.parent))
+from config import (
+    CITIES,
+    TARGET_CRS,
+    TREE_CADASTRE_COLUMNS,
+    TREE_CADASTRES_PROCESSED_DIR,
+    TREE_CADASTRES_RAW_DIR,
+)
 
 
 def load_raw_data() -> dict[str, gpd.GeoDataFrame]:
     """
     Lädt die rohen Baumkataster-Daten.
-
-    Returns:
-        Dictionary mit Stadt-Namen als Keys und GeoDataFrames als Values
     """
     print("Loading raw tree cadastre data...")
 
-    data = {}
-    for city in ["berlin", "hamburg", "rostock"]:
-        path = RAW_DIR / f"{city}_trees_raw.gpkg"
-        gdf = gpd.read_file(path)
-        data[city] = gdf
-        print(f"  {city.capitalize()}: {len(gdf):,} trees, CRS: {gdf.crs}")
-
-    return data
+    result = {}
+    for city in CITIES:
+        gdf = gpd.read_file(TREE_CADASTRES_RAW_DIR / f"{city.lower()}_trees_raw.gpkg")
+        print(f"  {city}: {len(gdf):,} trees, CRS: {gdf.crs}")
+        result[city.lower()] = gdf
+    return result
 
 
 def normalize_genus(genus: str | None) -> str | None:
     """
     Normalisiert Gattungsnamen zu Uppercase.
-
-    Args:
-        genus: Roher Gattungsname
-
-    Returns:
-        Normalisierter Gattungsname (Uppercase) oder None
     """
-    if pd.isna(genus) or genus is None or str(genus).strip() == "":
+    if not genus or pd.isna(genus) or not str(genus).strip():
         return None
     return str(genus).strip().upper()
+
+
+def normalize_species(species: str | None) -> str | None:
+    """
+    Normalisiert Artnamen zu lowercase.
+    
+    Entfernt Gattungspräfix falls vorhanden (z.B. "Quercus robur" -> "robur").
+    """
+    if not species or pd.isna(species):
+        return None
+    
+    species_str = str(species).strip()
+    if not species_str:
+        return None
+    
+    parts = species_str.split()
+    
+    # Remove genus prefix (first word) if present and capitalized
+    if len(parts) > 1 and parts[0][0].isupper():
+        return " ".join(parts[1:]).lower()
+    
+    return species_str.lower()
 
 
 def harmonize_berlin(gdf: gpd.GeoDataFrame) -> gpd.GeoDataFrame:
     """
     Harmonisiert Berlin-Baumkataster zum Zielschema.
-
-    Args:
-        gdf: Rohe Berlin-Daten
-
-    Returns:
-        Harmonisierte GeoDataFrame
     """
     print("\nHarmonizing Berlin...")
 
-    # Kopie erstellen
     df = gdf.copy()
 
-    # ID
     df["tree_id"] = df["gisid"]
-
-    # Stadt
     df["city"] = "Berlin"
-
-    # Gattung normalisieren (bereits Uppercase in Berlin)
     df["genus_latin"] = df["gattung"].apply(normalize_genus)
-
-    # Art (lateinisch)
-    df["species_latin"] = df["art_bot"]
-
-    # Pflanzjahr (String → Int)
-    df["plant_year"] = pd.to_numeric(df["pflanzjahr"], errors="coerce")
-    df["plant_year"] = df["plant_year"].astype("Int64")  # Nullable Integer
-
-    # Maße
+    df["species_latin"] = df["art_bot"].apply(normalize_species)
+    df["plant_year"] = pd.to_numeric(df["pflanzjahr"], errors="coerce").astype("Int64")
     df["height_m"] = pd.to_numeric(df["baumhoehe"], errors="coerce")
     df["crown_diameter_m"] = pd.to_numeric(df["kronedurch"], errors="coerce")
     df["stem_circumference_cm"] = pd.to_numeric(df["stammumfg"], errors="coerce")
 
-    # Source Layer (bereits vorhanden)
-    # df["source_layer"] bleibt
-
-    # CRS transformieren (25833 → 25832)
     df = df.to_crs(TARGET_CRS)
 
-    # Auf Zielschema reduzieren
-    result = gpd.GeoDataFrame(df[TARGET_COLUMNS], crs=TARGET_CRS)
+    result = gpd.GeoDataFrame(df[TREE_CADASTRE_COLUMNS], crs=TARGET_CRS)
 
     print(f"  ✓ {len(result):,} trees harmonized")
     print(f"  ✓ CRS: {result.crs}")
     print(f"  ✓ Unique genera: {result['genus_latin'].nunique()}")
+    print(f"  ✓ Unique species: {result['species_latin'].nunique()}")
 
     return result
 
@@ -122,63 +101,34 @@ def harmonize_berlin(gdf: gpd.GeoDataFrame) -> gpd.GeoDataFrame:
 def harmonize_hamburg(gdf: gpd.GeoDataFrame) -> gpd.GeoDataFrame:
     """
     Harmonisiert Hamburg-Baumkataster zum Zielschema.
-
-    Args:
-        gdf: Rohe Hamburg-Daten
-
-    Returns:
-        Harmonisierte GeoDataFrame
     """
     print("\nHarmonizing Hamburg...")
 
-    # Kopie erstellen
     df = gdf.copy()
-
-    # ID
+    
     df["tree_id"] = df["baumid"].astype(str)
-
-    # Stadt
     df["city"] = "Hamburg"
-
-    # Gattung normalisieren
     df["genus_latin"] = df["gattung_latein"].apply(normalize_genus)
-
-    # Art (lateinisch)
-    df["species_latin"] = df["art_latein"]
-
-    # Pflanzjahr (Float → Int)
-    df["plant_year"] = pd.to_numeric(df["pflanzjahr_portal"], errors="coerce")
-    df["plant_year"] = df["plant_year"].astype("Int64")  # Nullable Integer
-
-    # Maße (Hamburg hat keine Höhe)
+    df["species_latin"] = df["art_latein"].apply(normalize_species)
+    df["plant_year"] = pd.to_numeric(df["pflanzjahr_portal"], errors="coerce").astype("Int64")
     df["height_m"] = np.nan
     df["crown_diameter_m"] = pd.to_numeric(df["kronendurchmesser"], errors="coerce")
     df["stem_circumference_cm"] = pd.to_numeric(df["stammumfang"], errors="coerce")
-
-    # Source Layer (Hamburg hat keines)
-    df["source_layer"] = None
-
-    # MultiPoint → Point (nimm ersten Punkt)
-    def multipoint_to_point(geom):
-        if geom is None:
-            return None
-        if geom.geom_type == "MultiPoint":
-            # Nimm den ersten Punkt aus dem MultiPoint
-            return geom.geoms[0] if len(geom.geoms) > 0 else None
-        return geom
-
-    df["geometry"] = df["geometry"].apply(multipoint_to_point)
-
-    # CRS ist bereits 25832
-    df = df.set_crs(TARGET_CRS, allow_override=True)
-
-    # Auf Zielschema reduzieren
-    result = gpd.GeoDataFrame(df[TARGET_COLUMNS], crs=TARGET_CRS)
+    df["    uv run scripts/tree_cadastres/harmonize_tree_cadastres.py_layer"] = None
+    
+    # Convert MultiPoint to Point geometry
+    df["geometry"] = df["geometry"].apply(
+        lambda geom: (geom.geoms[0] if geom.geom_type == "MultiPoint" and len(geom.geoms) > 0 else geom)
+        if geom is not None else None
+    )
+    
+    result = gpd.GeoDataFrame(df[TREE_CADASTRE_COLUMNS], crs=TARGET_CRS)
 
     print(f"  ✓ {len(result):,} trees harmonized")
     print(f"  ✓ CRS: {result.crs}")
-    print(f"  ✓ Geometry converted: MultiPoint → Point")
+    print("  ✓ Geometry converted: MultiPoint → Point")
     print(f"  ✓ Unique genera: {result['genus_latin'].nunique()}")
+    print(f"  ✓ Unique species: {result['species_latin'].nunique()}")
 
     return result
 
@@ -186,50 +136,28 @@ def harmonize_hamburg(gdf: gpd.GeoDataFrame) -> gpd.GeoDataFrame:
 def harmonize_rostock(gdf: gpd.GeoDataFrame) -> gpd.GeoDataFrame:
     """
     Harmonisiert Rostock-Baumkataster zum Zielschema.
-
-    Args:
-        gdf: Rohe Rostock-Daten
-
-    Returns:
-        Harmonisierte GeoDataFrame
     """
     print("\nHarmonizing Rostock...")
 
-    # Kopie erstellen
     df = gdf.copy()
-
-    # ID
+    
     df["tree_id"] = df["uuid"]
-
-    # Stadt
     df["city"] = "Rostock"
-
-    # Gattung normalisieren
     df["genus_latin"] = df["gattung_botanisch"].apply(normalize_genus)
-
-    # Art (lateinisch)
-    df["species_latin"] = df["art_botanisch"]
-
-    # Pflanzjahr (Rostock hat keines)
+    df["species_latin"] = df["art_botanisch"].apply(normalize_species)
     df["plant_year"] = pd.NA
-
-    # Maße
     df["height_m"] = pd.to_numeric(df["hoehe"], errors="coerce")
     df["crown_diameter_m"] = pd.to_numeric(df["kronendurchmesser"], errors="coerce")
     df["stem_circumference_cm"] = pd.to_numeric(df["stammumfang"], errors="coerce")
-
-    # Source Layer (bereits vorhanden)
-    # df["source_layer"] bleibt
-
-    # CRS transformieren (25833 → 25832)
+    df["source_layer"] = None
+    
     df = df.to_crs(TARGET_CRS)
-
-    # Auf Zielschema reduzieren
-    result = gpd.GeoDataFrame(df[TARGET_COLUMNS], crs=TARGET_CRS)
+    result = gpd.GeoDataFrame(df[TREE_CADASTRE_COLUMNS], crs=TARGET_CRS)
 
     print(f"  ✓ {len(result):,} trees harmonized")
     print(f"  ✓ CRS: {result.crs}")
     print(f"  ✓ Unique genera: {result['genus_latin'].nunique()}")
+    print(f"  ✓ Unique species: {result['species_latin'].nunique()}")
 
     return result
 
@@ -237,12 +165,6 @@ def harmonize_rostock(gdf: gpd.GeoDataFrame) -> gpd.GeoDataFrame:
 def validate_harmonized(gdf: gpd.GeoDataFrame) -> bool:
     """
     Validiert das harmonisierte GeoDataFrame.
-
-    Args:
-        gdf: Harmonisierte Daten
-
-    Returns:
-        True wenn Validierung erfolgreich
     """
     print("\nValidating harmonized data...")
     issues = []
@@ -252,26 +174,22 @@ def validate_harmonized(gdf: gpd.GeoDataFrame) -> bool:
         issues.append(f"CRS mismatch: {gdf.crs} (expected {TARGET_CRS})")
 
     # Spalten prüfen
-    missing_cols = set(TARGET_COLUMNS) - set(gdf.columns)
+    missing_cols = set(TREE_CADASTRE_COLUMNS) - set(gdf.columns)
     if missing_cols:
         issues.append(f"Missing columns: {missing_cols}")
 
     # Geometrie-Typen prüfen
-    geom_types = gdf.geometry.type.unique()
-    if not all(gt == "Point" for gt in geom_types):
-        issues.append(f"Non-Point geometries found: {geom_types}")
+    if not gdf.geometry.type.eq("Point").all():
+        issues.append(f"Non-Point geometries found: {gdf.geometry.type.unique()}")
 
     # Eindeutigkeit prüfen
-    duplicates = gdf.groupby(["city", "tree_id"]).size()
-    duplicate_count = (duplicates > 1).sum()
+    duplicate_count = gdf.groupby(["city", "tree_id"]).size().gt(1).sum()
     if duplicate_count > 0:
         issues.append(f"Duplicate (city, tree_id) combinations: {duplicate_count}")
 
     # Städte prüfen
-    cities = set(gdf["city"].unique())
-    expected_cities = {"Berlin", "Hamburg", "Rostock"}
-    if cities != expected_cities:
-        issues.append(f"Cities mismatch: {cities} (expected {expected_cities})")
+    if set(gdf["city"].unique()) != set(CITIES):
+        issues.append(f"Cities mismatch: {set(gdf['city'].unique())} (expected {set(CITIES)})")
 
     if issues:
         print("⚠ Validation warnings:")
@@ -289,28 +207,35 @@ def print_summary(gdf: gpd.GeoDataFrame) -> None:
     print("HARMONIZATION SUMMARY")
     print("=" * 80)
 
+    total = len(gdf)
+    
     # Pro Stadt
     print("\nTrees per city:")
-    city_counts = gdf.groupby("city").size()
-    for city, count in city_counts.items():
+    for city, count in gdf.groupby("city").size().items():
         print(f"  {city:<10} {count:>10,}")
-    print(f"  {'TOTAL':<10} {len(gdf):>10,}")
+    print(f"  {'TOTAL':<10} {total:>10,}")
 
     # Top Gattungen
     print("\nTop 15 genera (genus_latin):")
-    genus_counts = gdf["genus_latin"].value_counts().head(15)
-    for genus, count in genus_counts.items():
-        pct = count / len(gdf) * 100
-        print(f"  {genus:<20} {count:>10,} ({pct:>5.1f}%)")
+    for genus, count in gdf["genus_latin"].value_counts().head(15).items():
+        print(f"  {genus:<20} {count:>10,} ({count / total * 100:>5.1f}%)")
+
+    # Top Arten
+    print("\nTop 15 species (species_latin):")
+    for species, count in gdf["species_latin"].value_counts().head(15).items():
+        print(f"  {species:<30} {count:>10,} ({count / total * 100:>5.1f}%)")
+
+    # Gesamtstatistiken
+    print(f"\nTotal unique genera: {gdf['genus_latin'].nunique()}")
+    print(f"Total unique species: {gdf['species_latin'].nunique()}")
 
     # NA-Anteile
     print("\nNull value percentages:")
     for col in ["genus_latin", "species_latin", "plant_year", "height_m", "source_layer"]:
-        null_pct = gdf[col].isna().sum() / len(gdf) * 100
-        print(f"  {col:<25} {null_pct:>6.1f}%")
+        print(f"  {col:<25} {gdf[col].isna().sum() / total * 100:>6.1f}%")
 
     # Geometry stats
-    print(f"\nGeometry type: {gdf.geometry.type.unique()[0]}")
+    print(f"\nGeometry type: {gdf.geometry.type.iloc[0]}")
     print(f"CRS: {gdf.crs}")
 
 
@@ -321,20 +246,20 @@ def main() -> None:
     print("=" * 80)
 
     # Ausgabeverzeichnis erstellen
-    PROCESSED_DIR.mkdir(parents=True, exist_ok=True)
+    TREE_CADASTRES_PROCESSED_DIR.mkdir(parents=True, exist_ok=True)
 
-    # Rohdaten laden
+    # Rohdaten laden und harmonisieren
     raw_data = load_raw_data()
-
-    # Städte harmonisieren
-    berlin_harmonized = harmonize_berlin(raw_data["berlin"])
-    hamburg_harmonized = harmonize_hamburg(raw_data["hamburg"])
-    rostock_harmonized = harmonize_rostock(raw_data["rostock"])
+    harmonized_gdfs = [
+        harmonize_berlin(raw_data["berlin"]),
+        harmonize_hamburg(raw_data["hamburg"]),
+        harmonize_rostock(raw_data["rostock"]),
+    ]
 
     # Zusammenführen
     print("\nMerging all cities...")
     gdf_all = gpd.GeoDataFrame(
-        pd.concat([berlin_harmonized, hamburg_harmonized, rostock_harmonized], ignore_index=True),
+        pd.concat(harmonized_gdfs, ignore_index=True),
         crs=TARGET_CRS,
     )
     print(f"✓ Total: {len(gdf_all):,} trees")
@@ -346,13 +271,10 @@ def main() -> None:
     print_summary(gdf_all)
 
     # Speichern
-    output_path = PROCESSED_DIR / "trees_harmonized.gpkg"
+    output_path = TREE_CADASTRES_PROCESSED_DIR / "trees_harmonized.gpkg"
     gdf_all.to_file(output_path, driver="GPKG")
     print(f"\n✓ Saved to: {output_path}")
-
-    # Dateigröße
-    size_mb = output_path.stat().st_size / (1024 * 1024)
-    print(f"✓ File size: {size_mb:.1f} MB")
+    print(f"✓ File size: {output_path.stat().st_size / (1024 * 1024):.1f} MB")
 
     print("\n" + "=" * 80)
     print("✓ Harmonization complete!")

@@ -48,11 +48,8 @@ Avoid building functionality on speculation. Implement features only when they a
 ```
 project/
 ├── data/
-│   ├── raw/              # DOM, DGM, tree cadastres (not in git)
-│   └── processed/        # CHM, aligned features (not in git)
 ├── scripts/              # Standalone data processing scripts
 ├── notebooks/            # EDA, experiments, visualizations
-├── src/                  # Reusable modules (preprocessing, models, eval)
 └── docs/                 # Method documentation, experiment logs
 ```
 
