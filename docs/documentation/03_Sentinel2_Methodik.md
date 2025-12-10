@@ -300,7 +300,80 @@ data/sentinel2/
 | CRS         | EPSG:25832                   |
 | Auflösung   | 10m × 10m                    |
 
-### 6.2 Scripts
+### 6.2 Band-Spezifikationen und Wertebereiche
+
+**WICHTIG für Feature Extraction und ML-Modelle:**
+
+Die Sentinel-2 Daten aus openEO haben spezifische Wertebereiche, die bei der Verarbeitung berücksichtigt werden müssen:
+
+#### Spektralbänder (Band 1-10)
+
+| Band | Name | Wellenlänge        | Wertebereich    | Skalierung              | Typischer Bereich |
+| ---- | ---- | ------------------ | --------------- | ----------------------- | ----------------- |
+| 1    | B02  | 490nm (Blue)       | -1000 bis 20000 | DN = Reflektanz × 10000 | 200-1500          |
+| 2    | B03  | 560nm (Green)      | 0 bis 20000     | DN = Reflektanz × 10000 | 300-2000          |
+| 3    | B04  | 665nm (Red)        | 0 bis 20000     | DN = Reflektanz × 10000 | 200-1500          |
+| 4    | B05  | 705nm (RE1)        | -1000 bis 18000 | DN = Reflektanz × 10000 | 500-2500          |
+| 5    | B06  | 740nm (RE2)        | -1000 bis 18000 | DN = Reflektanz × 10000 | 1000-4000         |
+| 6    | B07  | 783nm (RE3)        | -1000 bis 18000 | DN = Reflektanz × 10000 | 1500-4500         |
+| 7    | B08  | 842nm (NIR)        | -100 bis 17000  | DN = Reflektanz × 10000 | 1500-5000         |
+| 8    | B8A  | 865nm (Narrow NIR) | -500 bis 17000  | DN = Reflektanz × 10000 | 1500-5000         |
+| 9    | B11  | 1610nm (SWIR1)     | 0 bis 16000     | DN = Reflektanz × 10000 | 500-3000          |
+| 10   | B12  | 2190nm (SWIR2)     | -100 bis 16000  | DN = Reflektanz × 10000 | 300-2000          |
+
+**Hinweise zu Spektralbändern:**
+
+- **Skalierung:** Werte sind Reflektanz × 10000 (z.B. 693 = 6.93% Reflektanz)
+- **Negative Werte:** Können durch atmosphärische Korrektur entstehen, sind selten und meist nahe 0
+- **Normalisierung für ML:** Division durch 10000 für [0,1] Bereich oder StandardScaler verwenden
+
+#### Vegetationsindizes (Band 11-15)
+
+| Band | Name     | Formel                      | Wertebereich | Interpretation                                  |
+| ---- | -------- | --------------------------- | ------------ | ----------------------------------------------- |
+| 11   | NDre     | (B8A-B05)/(B8A+B05)         | [-1, 1]      | Red Edge NDVI, sensitiv für Chlorophyll         |
+| 12   | NDVIre   | (B8A-B04)/(B8A+B04)         | [-1, 1]      | Standard NDVI mit NIR narrow                    |
+| 13   | kNDVI    | tanh((B08-B04)²/(B08+B04)²) | [0, 1]       | Kernel NDVI, robust gegen Sättigung             |
+| 14   | VARI     | (B03-B04)/(B03+B04-B02)     | [-50, 50]\*  | Visible-only Index, ⚠️ instabil bei B03+B04≈B02 |
+| 15   | RTVIcore | 100×(B8A-B05)-10×(B8A-B04)  | [-∞, +∞]\*   | Red Edge Triangle VI, nicht normalisiert        |
+
+**⚠️ Bekannte Probleme bei Vegetationsindizes:**
+
+- **VARI:** Kann extreme Werte annehmen wenn Nenner nahe 0 → vor Nutzung clippen auf [-2, 2]
+- **RTVIcore:** Nicht normalisiert, Werte typisch 50000-200000 für Vegetation → Normalisierung erforderlich
+
+#### NoData-Behandlung
+
+| Wert   | Bedeutung         | Vorkommen                               |
+| ------ | ----------------- | --------------------------------------- |
+| -32768 | NoData (explizit) | Wolken, außerhalb Szene, fehlende Daten |
+| NaN    | NoData (implizit) | Berechnungsfehler bei Indizes           |
+
+**Code-Beispiel für korrekte NoData-Behandlung:**
+
+```python
+import numpy as np
+
+# Maske für gültige Pixel erstellen
+nodata = -32768
+valid_mask = (data != nodata) & (~np.isnan(data))
+
+# Nur gültige Werte für Statistiken/ML verwenden
+valid_data = data[valid_mask]
+
+# Spektralbänder normalisieren (optional)
+spectral_normalized = spectral_data / 10000.0  # → [0, ~2] Bereich
+```
+
+#### Empfehlungen für Feature Extraction
+
+1. **Spektralbänder:** Normalisierung durch /10000 oder StandardScaler
+2. **NDre, NDVIre, kNDVI:** Direkt verwendbar (bereits normalisiert)
+3. **VARI:** Clippen auf [-2, 2] vor Nutzung
+4. **RTVIcore:** StandardScaler oder Division durch 100000
+5. **NoData:** Immer auf -32768 UND NaN prüfen
+
+### 6.3 Scripts
 
 **Hauptscripts:**
 

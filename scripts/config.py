@@ -112,3 +112,57 @@ TREE_CADASTRE_COLUMNS = [
     "source_layer",
     "geometry",
 ]
+
+# =============================================================================
+# Höhendaten (DOM/DGM)
+# =============================================================================
+CHM_RAW_DIR = CHM_DIR / "raw"
+ELEVATION_RESOLUTION_M = 1  # 1m Auflösung
+
+# Source CRS für verschiedene Bundesländer
+ELEVATION_SOURCE_CRS = {
+    "Berlin": "EPSG:25833",      # UTM Zone 33N
+    "Hamburg": "EPSG:25832",     # UTM Zone 32N (already target CRS)
+    "Rostock": "EPSG:25833",     # MV: UTM Zone 33N
+}
+
+# Download-URLs und Feed-Endpoints
+ELEVATION_FEEDS = {
+    "Berlin": {
+        "DOM": "https://fbinter.stadt-berlin.de/fb/feed/senstadt/a_dom1",
+        "DGM": "https://gdi.berlin.de/data/dgm1/atom",
+        "type": "atom_nested",  # Feed hat nested structure
+    },
+    "Hamburg": {
+        "DOM": "https://daten-hamburg.de/opendata/"
+               "Digitales_Hoehenmodell_bDOM/dom1_xyz_HH_2021_04_30.zip",
+        "DGM": "https://daten-hamburg.de/geographie_geologie_geobasisdaten/"
+               "Digitales_Hoehenmodell/DGM1/dgm1_2x2km_XYZ_hh_2021_04_01.zip",
+        "type": "direct_download",  # Direct download links
+    },
+    "Rostock": {
+        "DOM": "https://www.geodaten-mv.de/dienste/dom_atom",
+        "DGM": "https://www.geodaten-mv.de/dienste/dgm_atom",
+        "type": "atom_filtered",  # Atom feed with spatial filtering (MV has 6407 tiles!)
+    },
+}
+
+# Konvertierungsparameter
+GDAL_TRANSLATE_OPTS = [
+    "-of", "GTiff",
+    "-co", "COMPRESS=LZW",
+    "-co", "TILED=YES",
+    "-co", "BIGTIFF=IF_SAFER",
+]
+
+GDALWARP_OPTS = [
+    "-r", "near",  # Nearest neighbor für 1m Daten
+    "-co", "COMPRESS=LZW",
+    "-co", "TILED=YES",
+    "-co", "BIGTIFF=IF_SAFER",
+]
+
+# Download-Parameter
+ELEVATION_MAX_RETRIES = 3
+ELEVATION_DOWNLOAD_TIMEOUT_S = 60
+ELEVATION_TIMEOUT_S = 600  # 10 min für GDAL-Operationen

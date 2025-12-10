@@ -2,12 +2,16 @@
 Lädt DOM und DGM Höhendaten für Hamburg herunter und verarbeitet sie.
 
 Datenquellen:
-- DOM: https://daten-hamburg.de (XYZ Format, 1m Auflösung)
-- DGM: https://daten-hamburg.de (XYZ Format, 1m Auflösung)
+- DOM: Hamburg Opendata (XYZ in ZIP, 1m Auflösung)
+- DGM: Hamburg Opendata (XYZ in ZIP, 1m Auflösung)
+
+Prozess:
+1. Download ZIPs direkt (keine Atom-Feeds)
+2. Extrahiere XYZ-Dateien
+3. Konvertiere XYZ zu GeoTIFF (Hamburg bereits in EPSG:25832)
+4. Mosaik + Clip auf Stadtgrenze mit Buffer
 """
 
-import logging
-import shutil
 import subprocess
 from pathlib import Path
 
@@ -18,52 +22,37 @@ from rasterio.mask import mask
 from rasterio.merge import merge
 from tqdm import tqdm
 
+from scripts.config import (
+    BOUNDARIES_BUFFERED_PATH,
+    CHM_RAW_DIR,
+    ELEVATION_FEEDS,
+    ELEVATION_MAX_RETRIES,
+    ELEVATION_SOURCE_CRS,
+    ELEVATION_TIMEOUT_S,
+    GDAL_TRANSLATE_OPTS,
+    GDALWARP_OPTS,
+    TARGET_CRS,
+)
 
-# Konstanten
+
 CITY = "Hamburg"
-DOM_URL = (
-    "https://daten-hamburg.de/opendata/"
-    "Digitales_Hoehenmodell_bDOM/dom1_xyz_HH_2021_04_30.zip"
-)
-DGM_URL = (
-    "https://daten-hamburg.de/geographie_geologie_geobasisdaten/"
-    "Digitales_Hoehenmodell/DGM1/dgm1_2x2km_XYZ_hh_2021_04_01.zip"
-)
-BOUNDARIES_PATH = Path("data/boundaries/city_boundaries_500m_buffer.gpkg")
-OUTPUT_DIR = Path("data/CHM/raw/hamburg")
-CRS = "EPSG:25832"
-MAX_RETRIES = 3
+OUTPUT_DIR = CHM_RAW_DIR / CITY.lower()
+DOM_URL = ELEVATION_FEEDS["Hamburg"]["DOM"]
+DGM_URL = ELEVATION_FEEDS["Hamburg"]["DGM"]
+SOURCE_CRS = ELEVATION_SOURCE_CRS["Hamburg"]
 
 
-# Logging Setup
-logging.basicConfig(
-    level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s"
-)
-logger = logging.getLogger(__name__)
-
-
-def download_file(url: str, output_path: Path, desc: str) -> None:
-    """
-    Lädt eine Datei mit Progress Bar und Retry-Logik herunter.
-
-    Args:
-        url: Download-URL
-        output_path: Ziel-Dateipfad
-        desc: Beschreibung für Progress Bar
-
-    Raises:
-        requests.HTTPError: Bei Download-Fehlern nach allen Retries
-    """
-    for attempt in range(1, MAX_RETRIES + 1):
+def download_file(url: str, output_path: Path) -> None:
+    """Lädt eine Datei mit Retry-Logik herunter."""
+    for attempt in range(1, ELEVATION_MAX_RETRIES + 1):
         try:
-            logger.info(f"Downloading {desc} (Attempt {attempt}/{MAX_RETRIES})...")
             response = requests.get(url, stream=True, timeout=60)
             response.raise_for_status()
 
             total_size = int(response.headers.get("content-length", 0))
 
             with open(output_path, "wb") as f, tqdm(
-                desc=desc,
+                desc=f"Downloading {output_path.name}",
                 total=total_size,
                 unit="iB",
                 unit_scale=True,
@@ -72,229 +61,144 @@ def download_file(url: str, output_path: Path, desc: str) -> None:
                 for chunk in response.iter_content(chunk_size=8192):
                     size = f.write(chunk)
                     pbar.update(size)
-
-            logger.info(f"Successfully downloaded {desc}")
             return
 
         except (requests.RequestException, IOError) as e:
-            logger.warning(f"Download attempt {attempt} failed: {e}")
-            if attempt == MAX_RETRIES:
+            if attempt == ELEVATION_MAX_RETRIES:
                 raise
-            logger.info("Retrying...")
+
+    raise RuntimeError(f"Failed to download {url} after {ELEVATION_MAX_RETRIES} attempts")
 
 
 def extract_xyz_from_zip(zip_path: Path, extract_dir: Path) -> list[Path]:
-    """
-    Extrahiert XYZ-Dateien aus ZIP-Archiv.
-
-    Nutzt system 'unzip' command für bessere Kompatibilität mit verschiedenen
-    ZIP-Kompressionsformaten.
-
-    Args:
-        zip_path: Pfad zum ZIP-Archiv
-        extract_dir: Extraktionsverzeichnis
-
-    Returns:
-        Liste der extrahierten XYZ-Dateipfade
-    """
-    logger.info(f"Extracting {zip_path.name}...")
+    """Extrahiert XYZ-Dateien aus ZIP-Archiv via system unzip."""
     extract_dir.mkdir(parents=True, exist_ok=True)
 
-    # Nutze system unzip für bessere Kompatibilität
     cmd = ["unzip", "-q", "-o", str(zip_path), "-d", str(extract_dir)]
 
     try:
         subprocess.run(cmd, check=True, capture_output=True, timeout=300)
     except subprocess.CalledProcessError as e:
-        logger.error(f"Unzip failed: {e.stderr.decode()}")
-        raise
+        raise RuntimeError(f"Unzip failed: {e.stderr.decode()}")
     except subprocess.TimeoutExpired:
-        logger.error("Unzip timed out after 5 minutes")
-        raise
+        raise RuntimeError("Unzip timed out after 5 minutes")
 
-    # Finde extrahierte XYZ-Dateien
     xyz_files = list(extract_dir.rglob("*.xyz"))
     xyz_files.extend(extract_dir.rglob("*.txt"))
 
-    logger.info(f"Extracted {len(xyz_files)} XYZ files")
     return xyz_files
 
 
-def xyz_to_geotiff(
-    xyz_path: Path, output_path: Path, crs: str = CRS
-) -> None:
+def xyz_to_geotiff(xyz_path: Path, output_path: Path) -> None:
     """
     Konvertiert XYZ ASCII-Datei zu GeoTIFF mit GDAL.
-
-    Args:
-        xyz_path: Pfad zur XYZ-Datei
-        output_path: Ausgabe-GeoTIFF-Pfad
-        crs: Ziel-CRS
-
-    Note:
-        Nutzt gdal_translate über subprocess für robuste Konvertierung
+    
+    Hamburg ist bereits in EPSG:25832 (target CRS).
+    Direktkonvertierung ohne Reprojizierung.
     """
-    import subprocess
-
-    logger.info(f"Converting {xyz_path.name} to GeoTIFF...")
-
-    cmd = [
-        "gdal_translate",
-        "-of", "GTiff",
-        "-a_srs", crs,
-        "-co", "COMPRESS=LZW",
-        "-co", "TILED=YES",
-        "-co", "BIGTIFF=YES",
-        str(xyz_path),
-        str(output_path),
-    ]
+    cmd = ["gdal_translate", "-of", "GTiff", "-a_srs", SOURCE_CRS] + GDAL_TRANSLATE_OPTS + [str(xyz_path), str(output_path)]
 
     try:
-        result = subprocess.run(
-            cmd, check=True, capture_output=True, text=True, timeout=600
+        subprocess.run(
+            cmd, check=True, capture_output=True, timeout=ELEVATION_TIMEOUT_S
         )
-        logger.info(f"Conversion successful: {output_path.name}")
-        if result.stdout:
-            logger.debug(result.stdout)
     except subprocess.CalledProcessError as e:
-        logger.error(f"GDAL conversion failed: {e.stderr}")
-        raise
+        raise RuntimeError(f"GDAL translate failed: {e.stderr}")
     except subprocess.TimeoutExpired:
-        logger.error("GDAL conversion timed out after 10 minutes")
-        raise
+        raise RuntimeError("GDAL translate timed out")
 
 
-def mosaic_with_gdalwarp(
-    geotiff_paths: list[Path], boundary_gdf: gpd.GeoDataFrame, output_path: Path
-) -> None:
-    """
-    Mosaiciert Tiles mit gdalwarp (für upside-down Raster).
-
-    Args:
-        geotiff_paths: Liste von GeoTIFF-Pfaden
-        boundary_gdf: GeoDataFrame mit Stadtgrenze
-        output_path: Ausgabe-Pfad
-    """
-    logger.info(f"Using gdalwarp to mosaic {len(geotiff_paths)} tiles...")
-
-    # Create VRT from all tiles
-    temp_vrt = output_path.parent / f"{output_path.stem}_temp.vrt"
-
-    # Build VRT
-    vrt_cmd = ["gdalbuildvrt", str(temp_vrt)] + [str(p) for p in geotiff_paths]
-
+def process_single_tile(
+    tile_dict: dict[str, str], temp_dir: Path
+) -> Path | None:
+    """Verarbeitet eine einzelne Kachel: Download -> Extraktion -> Konvertierung."""
     try:
-        subprocess.run(vrt_cmd, check=True, capture_output=True, timeout=300)
-        logger.info(f"Created VRT with {len(geotiff_paths)} tiles")
-    except subprocess.CalledProcessError as e:
-        logger.error(f"VRT creation failed: {e.stderr.decode()}")
-        raise
+        zip_path = temp_dir / tile_dict["filename"]
+        if not zip_path.exists():
+            download_file(tile_dict["url"], zip_path)
 
-    # Get boundary bounds in raster CRS
-    with rasterio.open(geotiff_paths[0]) as src:
-        raster_crs = src.crs
-    boundary_reproj = boundary_gdf.to_crs(raster_crs)
-    minx, miny, maxx, maxy = boundary_reproj.total_bounds
+        extract_dir = temp_dir / "extracted" / tile_dict["name"]
+        xyz_files = extract_xyz_from_zip(zip_path, extract_dir)
 
-    # Warp and clip VRT to boundary
-    warp_cmd = [
-        "gdalwarp",
-        "-te", str(minx), str(miny), str(maxx), str(maxy),
-        "-te_srs", str(raster_crs),
-        "-co", "COMPRESS=LZW",
-        "-co", "TILED=YES",
-        "-co", "BIGTIFF=YES",
-        str(temp_vrt),
-        str(output_path),
-    ]
+        if not xyz_files:
+            return None
 
-    try:
-        subprocess.run(warp_cmd, check=True, capture_output=True, timeout=1800)
-        logger.info("Warped and clipped to boundary")
-    except subprocess.CalledProcessError as e:
-        logger.error(f"Gdalwarp failed: {e.stderr.decode()}")
-        raise
+        geotiff_path = temp_dir / "geotiffs" / f"{tile_dict['name']}.tif"
+        geotiff_path.parent.mkdir(parents=True, exist_ok=True)
 
-    # Cleanup temp files
-    temp_vrt.unlink()
+        # Hamburg kann mehrere XYZ-Dateien haben, konvertiere alle
+        for xyz_file in xyz_files:
+            xyz_to_geotiff(xyz_file, geotiff_path)
+            break  # Nutze nur erste Datei
 
-    logger.info(f"Mosaic saved to: {output_path}")
+        return geotiff_path
+
+    except Exception:
+        return None
+
+
+def download_and_convert_tiles(
+    urls: dict[str, str], temp_dir: Path
+) -> list[Path]:
+    """Lädt und konvertiert DOM und DGM."""
+    temp_dir.mkdir(parents=True, exist_ok=True)
+    geotiff_paths = []
+
+    for data_type, url in urls.items():
+        try:
+            tile_dict = {
+                "name": data_type.lower(),
+                "url": url,
+                "filename": f"{data_type.lower()}.zip",
+            }
+            result = process_single_tile(tile_dict, temp_dir)
+            if result is not None:
+                geotiff_paths.append(result)
+        except Exception:
+            continue
+
+    return geotiff_paths
 
 
 def mosaic_and_clip(
     geotiff_paths: list[Path], boundary_gdf: gpd.GeoDataFrame, output_path: Path
 ) -> None:
-    """
-    Mosaiciert mehrere GeoTIFF-Tiles und clippt auf Stadtgrenze.
-
-    Args:
-        geotiff_paths: Liste von GeoTIFF-Pfaden
-        boundary_gdf: GeoDataFrame mit Stadtgrenze
-        output_path: Ausgabe-Pfad
-    """
+    """Erstellt Mosaik aus GeoTIFFs und clippt auf Stadtgrenze."""
     if not geotiff_paths:
         raise ValueError("No GeoTIFF tiles to mosaic")
 
-    logger.info(f"Mosaicking {len(geotiff_paths)} tiles...")
-
-    # Öffne alle Tiles und prüfe auf "upside down" Raster
     src_files = []
-    needs_flip = False
-    for path in geotiff_paths:
+    for p in geotiff_paths:
         try:
-            src = rasterio.open(path)
-            # Check if raster is upside down (negative pixel height)
-            if src.transform.e < 0:  # Negative Y pixel size
-                needs_flip = True
+            src = rasterio.open(p)
             src_files.append(src)
-        except Exception as e:
-            logger.warning(f"Could not open {path}: {e}")
+        except Exception:
+            continue
 
     if not src_files:
         raise ValueError("No valid GeoTIFF tiles to mosaic")
 
-    logger.info(f"Using {len(src_files)} valid tiles for mosaic")
-
-    if needs_flip:
-        logger.warning(
-            "Detected upside-down rasters (negative pixel height). "
-            "Using gdalwarp workaround..."
-        )
-        # Close files for gdalwarp approach
-        for src in src_files:
-            src.close()
-        src_files = []
-
-        # Use gdalwarp to merge upside-down rasters
-        return mosaic_with_gdalwarp(geotiff_paths, boundary_gdf, output_path)
-
     try:
-        # Mosaic tiles with rasterio
         mosaic, out_trans = merge(src_files, method="first")
-
-        # Temporäres Mosaic speichern
         temp_mosaic = output_path.parent / f"{output_path.stem}_temp.tif"
+
         out_meta = src_files[0].meta.copy()
         out_meta.update({
             "height": mosaic.shape[1],
             "width": mosaic.shape[2],
             "transform": out_trans,
             "compress": "lzw",
+            "tiled": True,
         })
 
         with rasterio.open(temp_mosaic, "w", **out_meta) as dest:
             dest.write(mosaic)
 
-        logger.info(f"Mosaic created: {mosaic.shape[1]}x{mosaic.shape[2]} pixels")
-
     finally:
-        # Schließe alle Source-Files
         for src in src_files:
             src.close()
 
     # Clip to boundary
-    logger.info("Clipping mosaic to city boundary...")
-
     with rasterio.open(temp_mosaic) as src:
         boundary_reproj = boundary_gdf.to_crs(src.crs)
 
@@ -313,144 +217,98 @@ def mosaic_and_clip(
         with rasterio.open(output_path, "w", **out_meta) as dest:
             dest.write(out_image)
 
-    # Cleanup temp mosaic
     temp_mosaic.unlink()
-
-    logger.info(f"Clipped mosaic saved to: {output_path}")
 
 
 def validate_geotiff(file_path: Path) -> bool:
-    """
-    Validiert GeoTIFF-Datei.
-
-    Args:
-        file_path: Pfad zur GeoTIFF-Datei
-
-    Returns:
-        True wenn valide, sonst False
-    """
+    """Validiert GeoTIFF-Datei."""
     try:
         with rasterio.open(file_path) as src:
-            _ = src.read(1, window=((0, 10), (0, 10)))  # Test read
-            logger.info(
-                f"Validated {file_path.name}: "
-                f"{src.width}x{src.height}, CRS: {src.crs}"
-            )
+            _ = src.read(1, window=((0, 10), (0, 10)))
         return True
-    except Exception as e:
-        logger.error(f"Validation failed for {file_path}: {e}")
+    except Exception:
         return False
 
 
 def process_elevation_data(
-    url: str, data_type: str, temp_dir: Path, output_path: Path,
+    urls: dict[str, str], temp_dir: Path, output_paths: dict[str, Path],
     boundary_gdf: gpd.GeoDataFrame
 ) -> None:
-    """
-    Verarbeitet Höhendaten von Download bis zum finalen Clip.
-
-    Args:
-        url: Download-URL
-        data_type: "DOM" oder "DGM"
-        temp_dir: Temporäres Verzeichnis
-        output_path: Finaler Output-Pfad
-        boundary_gdf: Stadtgrenze zum Clippen
-    """
-    # Skip if output already exists and is valid
-    if output_path.exists() and validate_geotiff(output_path):
-        logger.info(f"{data_type} already exists and is valid, skipping...")
+    """Verarbeitet DOM und DGM zusammen (Hamburg ist One-Shot)."""
+    # Check if both already exist
+    if all(p.exists() and validate_geotiff(p) for p in output_paths.values()):
         return
 
-    # Download ZIP
-    zip_path = temp_dir / f"{data_type.lower()}.zip"
-    download_file(url, zip_path, f"{data_type} ZIP")
-
-    # Extract XYZ
-    extract_dir = temp_dir / data_type.lower()
-    xyz_files = extract_xyz_from_zip(zip_path, extract_dir)
-
-    if not xyz_files:
-        raise FileNotFoundError(f"No XYZ files found in {zip_path}")
-
-    logger.info(f"Found {len(xyz_files)} XYZ files to process")
-
-    # Convert ALL XYZ files to GeoTIFF
-    geotiff_dir = temp_dir / f"{data_type.lower()}_tif"
-    geotiff_dir.mkdir(exist_ok=True)
-    geotiff_paths = []
-
-    for i, xyz_file in enumerate(xyz_files, 1):
-        logger.info(f"Converting tile {i}/{len(xyz_files)}: {xyz_file.name}")
-        geotiff_path = geotiff_dir / f"{xyz_file.stem}.tif"
-        try:
-            xyz_to_geotiff(xyz_file, geotiff_path)
-            geotiff_paths.append(geotiff_path)
-        except Exception as e:
-            logger.warning(f"Failed to convert {xyz_file.name}: {e}")
+    # Hamburg: Download both DOM and DGM
+    geotiff_paths = download_and_convert_tiles(urls, temp_dir)
 
     if not geotiff_paths:
-        raise ValueError("No GeoTIFF tiles were successfully created")
+        raise ValueError("No GeoTIFF tiles created")
 
-    logger.info(f"Successfully converted {len(geotiff_paths)}/{len(xyz_files)} tiles")
+    # Hamburg hat nur eine Datei je Typ, kein Mosaic nötig
+    # Aber wir clippen trotzdem auf Boundary mit Buffer
+    for geotiff_path in geotiff_paths:
+        # Bestimme output file basierend auf naming
+        if "dom" in geotiff_path.stem.lower():
+            output_path = output_paths["DOM"]
+        else:
+            output_path = output_paths["DGM"]
 
-    # Mosaic all tiles and clip to boundary
-    mosaic_and_clip(geotiff_paths, boundary_gdf, output_path)
+        # Clip to boundary (tqdm nicht nötig, nur eine Datei)
+        with rasterio.open(geotiff_path) as src:
+            boundary_reproj = boundary_gdf.to_crs(src.crs)
+
+            out_image, out_transform = mask(
+                src, boundary_reproj.geometry, crop=True, all_touched=True
+            )
+
+            out_meta = src.meta.copy()
+            out_meta.update({
+                "height": out_image.shape[1],
+                "width": out_image.shape[2],
+                "transform": out_transform,
+                "compress": "lzw",
+            })
+
+            with rasterio.open(output_path, "w", **out_meta) as dest:
+                dest.write(out_image)
 
     # Validate
-    if not validate_geotiff(output_path):
-        raise ValueError(f"Output validation failed for {output_path}")
+    for data_type, output_path in output_paths.items():
+        if not validate_geotiff(output_path):
+            raise ValueError(f"Output validation failed for {output_path}")
 
 
 def main() -> None:
-    """Hauptfunktion: Lädt und verarbeitet Höhendaten für Hamburg."""
-    logger.info("=" * 70)
-    logger.info("Hamburg Elevation Data Download - DOM & DGM")
-    logger.info("=" * 70)
-
-    # Setup
+    """Hauptfunktion: Lädt und verarbeitet DOM & DGM für Hamburg."""
     OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
     temp_dir = OUTPUT_DIR / "temp"
     temp_dir.mkdir(exist_ok=True)
 
-    # Load city boundary
-    logger.info(f"Loading boundary from {BOUNDARIES_PATH}...")
-    boundaries = gpd.read_file(BOUNDARIES_PATH)
+    boundaries = gpd.read_file(BOUNDARIES_BUFFERED_PATH)
     hamburg_boundary = boundaries[boundaries["gen"] == CITY]
 
     if hamburg_boundary.empty:
         raise ValueError(f"No boundary found for {CITY}")
 
-    logger.info(f"Boundary loaded: CRS {hamburg_boundary.crs}")
+    # Hamburg: Direct download URLs
+    urls = {
+        "DOM": DOM_URL,
+        "DGM": DGM_URL,
+    }
 
-    # Process DOM
-    dom_output = OUTPUT_DIR / "dom_1m.tif"
-    try:
-        process_elevation_data(
-            DOM_URL, "DOM", temp_dir, dom_output, hamburg_boundary
-        )
-    except Exception as e:
-        logger.error(f"DOM processing failed: {e}")
-        raise
+    output_paths = {
+        "DOM": OUTPUT_DIR / "dom_1m.tif",
+        "DGM": OUTPUT_DIR / "dgm_1m.tif",
+    }
 
-    # Process DGM
-    dgm_output = OUTPUT_DIR / "dgm_1m.tif"
-    try:
-        process_elevation_data(
-            DGM_URL, "DGM", temp_dir, dgm_output, hamburg_boundary
-        )
-    except Exception as e:
-        logger.error(f"DGM processing failed: {e}")
-        raise
+    process_elevation_data(urls, temp_dir, output_paths, hamburg_boundary)
 
-    # Cleanup temp files
-    logger.info("Cleaning up temporary files...")
+    # Cleanup
+    import shutil
     shutil.rmtree(temp_dir)
 
-    logger.info("=" * 70)
-    logger.info("Hamburg elevation data processing complete!")
-    logger.info(f"DOM: {dom_output}")
-    logger.info(f"DGM: {dgm_output}")
-    logger.info("=" * 70)
+    print(f"Hamburg elevation data complete: {list(output_paths.values())}")
 
 
 if __name__ == "__main__":
