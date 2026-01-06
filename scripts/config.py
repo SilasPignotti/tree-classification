@@ -73,6 +73,7 @@ EXPECTED_BAND_COUNT = len(SPECTRAL_BANDS) + len(VEGETATION_INDICES)
 TREE_CADASTRES_RAW_DIR = TREE_CADASTRES_DIR / "raw"
 TREE_CADASTRES_PROCESSED_DIR = TREE_CADASTRES_DIR / "processed"
 TREE_CADASTRES_METADATA_DIR = TREE_CADASTRES_DIR / "metadata"
+TREE_CADASTRES_VALIDATION_DIR = TREE_CADASTRES_DIR / "validation"
 
 TREE_CADASTRE_CONFIG = {
     "Hamburg": {
@@ -117,6 +118,7 @@ TREE_CADASTRE_COLUMNS = [
 # Höhendaten (DOM/DGM)
 # =============================================================================
 CHM_RAW_DIR = CHM_DIR / "raw"
+CHM_PROCESSED_DIR = CHM_DIR / "processed"
 ELEVATION_RESOLUTION_M = 1  # 1m Auflösung
 
 # Source CRS für verschiedene Bundesländer
