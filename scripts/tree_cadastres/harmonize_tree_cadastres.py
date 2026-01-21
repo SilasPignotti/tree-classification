@@ -83,8 +83,12 @@ def harmonize_berlin(gdf: gpd.GeoDataFrame) -> gpd.GeoDataFrame:
     df["species_latin"] = df["art_bot"].apply(normalize_species)
     df["plant_year"] = pd.to_numeric(df["pflanzjahr"], errors="coerce").astype("Int64")
     df["height_m"] = pd.to_numeric(df["baumhoehe"], errors="coerce")
-    df["crown_diameter_m"] = pd.to_numeric(df["kronedurch"], errors="coerce")
-    df["stem_circumference_cm"] = pd.to_numeric(df["stammumfg"], errors="coerce")
+    
+    # Map source_layer to tree_type for Berlin trees
+    df["tree_type"] = df["source_layer"].map({
+        "baumbestand:anlagenbaeume": "Anlagenbaum",
+        "baumbestand:strassenbaeume": "Straßenbaum",
+    })
 
     df = df.to_crs(TARGET_CRS)
 
@@ -112,9 +116,7 @@ def harmonize_hamburg(gdf: gpd.GeoDataFrame) -> gpd.GeoDataFrame:
     df["species_latin"] = df["art_latein"].apply(normalize_species)
     df["plant_year"] = pd.to_numeric(df["pflanzjahr_portal"], errors="coerce").astype("Int64")
     df["height_m"] = np.nan
-    df["crown_diameter_m"] = pd.to_numeric(df["kronendurchmesser"], errors="coerce")
-    df["stem_circumference_cm"] = pd.to_numeric(df["stammumfang"], errors="coerce")
-    df["    uv run scripts/tree_cadastres/harmonize_tree_cadastres.py_layer"] = None
+    df["tree_type"] = np.nan
     
     # Convert MultiPoint to Point geometry
     df["geometry"] = df["geometry"].apply(
@@ -147,9 +149,7 @@ def harmonize_rostock(gdf: gpd.GeoDataFrame) -> gpd.GeoDataFrame:
     df["species_latin"] = df["art_botanisch"].apply(normalize_species)
     df["plant_year"] = pd.NA
     df["height_m"] = pd.to_numeric(df["hoehe"], errors="coerce")
-    df["crown_diameter_m"] = pd.to_numeric(df["kronendurchmesser"], errors="coerce")
-    df["stem_circumference_cm"] = pd.to_numeric(df["stammumfang"], errors="coerce")
-    df["source_layer"] = None
+    df["tree_type"] = np.nan
     
     df = df.to_crs(TARGET_CRS)
     result = gpd.GeoDataFrame(df[TREE_CADASTRE_COLUMNS], crs=TARGET_CRS)
@@ -231,7 +231,7 @@ def print_summary(gdf: gpd.GeoDataFrame) -> None:
 
     # NA-Anteile
     print("\nNull value percentages:")
-    for col in ["genus_latin", "species_latin", "plant_year", "height_m", "source_layer"]:
+    for col in ["genus_latin", "species_latin", "plant_year", "height_m", "tree_type"]:
         print(f"  {col:<25} {gdf[col].isna().sum() / total * 100:>6.1f}%")
 
     # Geometry stats

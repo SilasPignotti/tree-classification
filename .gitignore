@@ -15,11 +15,20 @@ data/CHM/
 data/tree_cadastres/
 data/boundaries/
 
+# Model files (too large for git)
+results/**/*.pkl
+results/**/*.h5
+results/**/*.npy
+results/**/*.pt
+results/**/*.pth
+
 
 # Task management
 tasks/
 docs/documentation_old/
 docs/Projektdesign.json
+docs/arbeitsprotokolle/
+docs/gpt_knowledge/
 
 # Project-specific files
 CHANGELOG.md

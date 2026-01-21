@@ -1,0 +1,13 @@
+{
+  "model": "1D-CNN (Multi-Input)",
+  "city": "berlin",
+  "architecture": "Conv1D + Dense (S2 + CHM)",
+  "train_oa": 0.5888661284492107,
+  "val_oa": 0.4685771744595274,
+  "train_f1_macro": 0.586073731064201,
+  "val_f1_macro": 0.4619529663838441,
+  "final_train_acc": 0.8255211710929871,
+  "final_val_acc": 0.4841628968715668,
+  "best_val_acc": 0.49371543526649475,
+  "epochs_trained": 14
+}

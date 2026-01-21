@@ -97,8 +97,6 @@ TREE_CADASTRE_CONFIG = {
 # =============================================================================
 CHM_REFERENCE_YEAR = 2021
 MIN_SAMPLES_PER_CITY = 500
-EDGE_DISTANCE_THRESHOLDS_M = [15, 20, 30]
-GRID_CELL_SIZE_M = 1000
 
 # Harmonisiertes Zielschema für Baumkataster
 TREE_CADASTRE_COLUMNS = [
@@ -108,9 +106,7 @@ TREE_CADASTRE_COLUMNS = [
     "species_latin",
     "plant_year",
     "height_m",
-    "crown_diameter_m",
-    "stem_circumference_cm",
-    "source_layer",
+    "tree_type",
     "geometry",
 ]
 
